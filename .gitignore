@@ -1,0 +1,7 @@
+config.json
+logs/
+__pycache__/
+added_torrents/
+completed_torrents/
+.devcontainer/devcontainer.json
+tasks.db
