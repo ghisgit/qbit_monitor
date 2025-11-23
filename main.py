@@ -127,16 +127,22 @@ class QBitMonitor:
         # 1. 加载数据库中的任务
         self.task_manager.load_pending_tasks()
 
-        # 2. 立即启动事件监控
+        # 2. 加载待重试任务
+        self.task_manager.load_retry_tasks()
+
+        # 3. 立即启动事件监控
         self.logger.info("启动事件监控...")
         self.directory_monitor.start()
         self.logger.info("事件监控已启动")
 
-        # 3. 安全扫描目录文件
+        # 4. 安全扫描目录文件
         self._safe_scan_existing_hash_files()
 
-        # 4. 启动工作线程
+        # 5. 启动工作线程
         self.task_manager.start_all_workers()
+
+        # 6. 启动重试工作线程
+        self.task_manager.start_retry_worker()
 
         self.logger.info("所有启动任务加载完成，开始处理...")
 

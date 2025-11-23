@@ -174,8 +174,8 @@ class EventHandler:
 
         return deleted_count
 
-    def process_torrent_addition(self, torrent_hash: str, hash_file_path: str) -> bool:
-        """处理新添加的种子，返回是否处理完成（True=完成，False=需要重试）"""
+    def process_torrent_addition(self, torrent_hash: str, hash_file_path: str) -> str:
+        """处理新添加的种子，返回状态码"""
         self.logger.info(f"处理新添加的种子: {torrent_hash}")
 
         try:
@@ -187,7 +187,7 @@ class EventHandler:
                 if os.path.exists(hash_file_path):
                     os.remove(hash_file_path)
                     self.logger.info(f"已删除不存在的种子哈希文件: {hash_file_path}")
-                return True
+                return "success"
 
             torrent_name = torrent.get("name", "Unknown")
 
@@ -196,13 +196,13 @@ class EventHandler:
                 self.logger.info(f"种子不符合处理条件: {torrent_name}")
                 if os.path.exists(hash_file_path):
                     os.remove(hash_file_path)
-                return True
+                return "success"
 
             # 检查是否可以获取文件列表（相当于等待元数据）
             files = self.qbt_client.get_torrent_files(torrent_hash)
             if not files:
-                self.logger.debug(f"种子 {torrent_name} 元数据未就绪，需要重试")
-                return False
+                self.logger.debug(f"种子 {torrent_name} 元数据未就绪，需要延迟重试")
+                return "retry_later"  # 返回重试状态
 
             # 禁用匹配的文件（使用 disable_file_patterns）
             success = self.disable_files_for_torrent(torrent)
@@ -211,19 +211,17 @@ class EventHandler:
                 self.logger.info(f"成功处理新添加种子: {torrent_name}")
                 if os.path.exists(hash_file_path):
                     os.remove(hash_file_path)
-                return True
+                return "success"
             else:
                 self.logger.warning(f"种子 {torrent_name} 文件禁用失败，需要重试")
-                return False
+                return "retry_later"
 
         except Exception as e:
             self.logger.error(f"处理新添加种子 {torrent_hash} 时发生错误: {e}")
-            return False
+            return "retry_later"
 
-    def process_torrent_completion(
-        self, torrent_hash: str, hash_file_path: str
-    ) -> bool:
-        """处理已完成的种子，返回是否处理完成（True=完成，False=需要重试）"""
+    def process_torrent_completion(self, torrent_hash: str, hash_file_path: str) -> str:
+        """处理已完成的种子，返回状态码"""
         self.logger.info(f"处理已完成的种子: {torrent_hash}")
 
         try:
@@ -235,7 +233,7 @@ class EventHandler:
                 if os.path.exists(hash_file_path):
                     os.remove(hash_file_path)
                     self.logger.info(f"已删除不存在的种子哈希文件: {hash_file_path}")
-                return True
+                return "success"
 
             torrent_name = torrent.get("name", "Unknown")
 
@@ -244,7 +242,7 @@ class EventHandler:
                 self.logger.info(f"种子不符合处理条件: {torrent_name}")
                 if os.path.exists(hash_file_path):
                     os.remove(hash_file_path)
-                return True
+                return "success"
 
             # 清理文件（基于文件系统，使用 file_patterns 和 folder_patterns）
             deleted_count = self.clean_torrent_files(torrent)
@@ -254,8 +252,8 @@ class EventHandler:
 
             if os.path.exists(hash_file_path):
                 os.remove(hash_file_path)
-            return True
+            return "success"
 
         except Exception as e:
             self.logger.error(f"处理已完成种子 {torrent_hash} 时发生错误: {e}")
-            return False
+            return "retry_later"
