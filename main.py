@@ -106,6 +106,8 @@ class QBitMonitor:
         self.running = True
         self._setup_signal_handlers()
 
+        self.qbt_client.wait_for_qbit()
+
         self.logger.info("qBittorrent 监控器启动")
         self.logger.info(f"最大工作线程数: {self.task_manager.max_workers}")
 

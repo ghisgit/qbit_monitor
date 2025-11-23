@@ -50,3 +50,16 @@ class QBittorrentClient:
         except Exception as e:
             self.logger.error(f"设置文件优先级时发生错误: {e}")
             return False
+
+    def wait_for_qbit(self):
+        self.logger.info(f"wait qBittorrent start...")
+        while True:
+            try:
+                response = self.session.get(f"{self.base_url}/api/v2/app/version")
+                if response.status_code == 200:
+                    self.logger.info(
+                        f"qBittorrent started! qBittorrent version: {response.text}"
+                    )
+                    break
+            except Exception as e:
+                self.logger.error(f"qBittorrent not start, wait...")
