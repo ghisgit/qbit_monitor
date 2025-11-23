@@ -178,9 +178,9 @@ class TaskStore:
         task_type: str,
         hash_file_path: str,
         retry_time: float,
-        retry_count: int = 0,
+        retry_count: int,
     ):
-        """保存重试任务"""
+        """保存重试任务（不自动递增计数）"""
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
@@ -194,7 +194,7 @@ class TaskStore:
                 )
 
             self.logger.debug(
-                f"保存重试任务: {task_type} - {torrent_hash}, 重试时间: {retry_time}"
+                f"保存重试任务: {task_type} - {torrent_hash}, 重试次数: {retry_count}"
             )
 
         except Exception as e:

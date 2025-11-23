@@ -63,6 +63,7 @@ class TaskWorkerManager:
                             ready_tasks.append(
                                 (task_type, torrent_hash, hash_file_path, retry_count)
                             )
+                            # 从内存中删除，但保留在数据库中直到成功完成
                             del self.retry_tasks[torrent_hash]
 
                 # 提交就绪的任务
@@ -70,7 +71,7 @@ class TaskWorkerManager:
                     if retry_count >= 0:  # 最大重试次数
                         self.submit_task(task_type, torrent_hash, hash_file_path)
                         self.logger.info(
-                            f"重试任务 ({retry_count + 1}/无限): {torrent_hash}"
+                            f"重试任务 ({retry_count}/无限): {torrent_hash}"
                         )
                     else:
                         self.logger.warning(
@@ -97,20 +98,42 @@ class TaskWorkerManager:
         """安排延迟重试"""
         retry_time = time.time() + delay
 
-        # 获取当前重试计数
-        retry_count = self.task_store.increment_retry_count(torrent_hash, task_type)
-
+        # 检查是否已有重试任务
         with self.retry_lock:
+            existing_task = self.retry_tasks.get(torrent_hash)
+            if existing_task:
+                # 如果任务已存在，使用现有的重试计数
+                _, _, _, retry_count = existing_task
+                retry_count += 1  # 增加计数
+            else:
+                # 新重试任务，从数据库获取当前计数或初始化为0
+                retry_count = self._get_retry_count_from_db(torrent_hash, task_type)
+                retry_count += 1
+
+            # 保存到内存和数据库
             self.retry_tasks[torrent_hash] = (
                 task_type,
                 hash_file_path,
                 retry_time,
                 retry_count,
             )
+            self.task_store.save_retry_task(
+                torrent_hash, task_type, hash_file_path, retry_time, retry_count
+            )
 
-        self.logger.debug(
-            f"安排 {delay} 秒后重试 ({retry_count + 1}/5): {torrent_hash}"
-        )
+        self.logger.debug(f"安排 {delay} 秒后重试 ({retry_count}/5): {torrent_hash}")
+
+    def _get_retry_count_from_db(self, torrent_hash: str, task_type: str) -> int:
+        """从数据库获取当前重试计数"""
+        try:
+            retry_tasks = self.task_store.get_pending_retry_tasks()
+            for task_hash, t_type, _, _, retry_count in retry_tasks:
+                if task_hash == torrent_hash and t_type == task_type:
+                    return retry_count
+            return 0  # 没有找到记录，返回0
+        except Exception as e:
+            self.logger.error(f"获取重试计数失败: {e}")
+            return 0
 
     def load_retry_tasks(self):
         """从数据库加载待重试任务"""
@@ -127,9 +150,10 @@ class TaskWorkerManager:
                 retry_time,
                 retry_count,
             ) in retry_tasks:
-                # 如果重试时间已过，立即重试
+                # 如果重试时间已过，调整到近期重试
                 if retry_time <= current_time:
                     retry_time = current_time + 5  # 5秒后重试
+                    # 更新数据库中的重试时间，但不改变计数
                     self.task_store.save_retry_task(
                         torrent_hash, task_type, hash_file_path, retry_time, retry_count
                     )
@@ -333,8 +357,12 @@ class TaskWorkerManager:
                         task_type, torrent_hash, hash_file_path, delay=30
                     )
                     return True  # 当前任务标记为完成，但会创建延迟重试
+                elif result == "success":
+                    # 任务成功完成，删除重试记录（如果存在）
+                    self.task_store.delete_retry_task(torrent_hash, task_type)
+                    return True
                 else:
-                    return result == "success"
+                    return False
 
             elif task_type == "completed":
                 result = self.event_handler.process_torrent_completion(
@@ -346,8 +374,12 @@ class TaskWorkerManager:
                         task_type, torrent_hash, hash_file_path, delay=30
                     )
                     return True
+                elif result == "success":
+                    # 任务成功完成，删除重试记录
+                    self.task_store.delete_retry_task(torrent_hash, task_type)
+                    return True
                 else:
-                    return result == "success"
+                    return False
 
             return False
 
