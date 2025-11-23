@@ -1,4 +1,5 @@
-#!/usr/bin/bash
+#!/bin/bash
+
 host=172.17.0.1
 port=8080
 
