@@ -1,7 +1,7 @@
-config.json
+db/
 logs/
 __pycache__/
 added_torrents/
 completed_torrents/
+config.json
 .devcontainer/devcontainer.json
-tasks.db

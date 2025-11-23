@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 from config.settings import Config
-from config.paths import ADDED_TORRENTS_DIR, COMPLETED_TORRENTS_DIR, LOG_FILE
+from config.paths import ADDED_TORRENTS_DIR, COMPLETED_TORRENTS_DIR, LOG_FILE, DB_FILE
 from utils.logging import setup_logging
 from core.qbittorrent import QBittorrentClient
 from core.file_operations import FileOperations
@@ -34,7 +34,7 @@ class QBitMonitor:
         self.config.load_config()
 
         # 核心组件
-        self.task_store = TaskStore("tasks.db")
+        self.task_store = TaskStore(DB_FILE)
         self.qbt_client = QBittorrentClient(self.config.host, self.config.port)
         self.file_ops = FileOperations(self.config)
         self.event_handler = EventHandler(self.qbt_client, self.file_ops, self.config)
@@ -165,6 +165,11 @@ class QBitMonitor:
         self.running = False
         self.directory_monitor.stop()
         self.task_manager.stop_all_workers()
+
+        # 关闭数据库管理器
+        if hasattr(self, "task_store"):
+            self.task_store.close()
+
         self.logger.info("qBittorrent 监控器已停止")
 
     def signal_handler(self, signum, frame):

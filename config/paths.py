@@ -12,6 +12,7 @@ COMPLETED_TORRENTS_DIR = BASE_DIR / "scripts/completed_torrents"
 
 # 日志文件
 LOG_FILE = BASE_DIR / "logs/qbit_monitor.log"
+DB_FILE = BASE_DIR / "db/tasks.db"
 
 # 确保目录存在
 ADDED_TORRENTS_DIR.mkdir(exist_ok=True)
