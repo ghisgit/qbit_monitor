@@ -398,27 +398,6 @@ class TaskStore:
         except Exception as e:
             self.logger.error(f"清理孤立任务失败: {e}")
 
-    def save_retry_task_async(
-        self,
-        torrent_hash: str,
-        task_type: str,
-        hash_file_path: str,
-        retry_time: float,
-        retry_count: int,
-    ):
-        """异步保存重试任务"""
-        try:
-            self.db_manager.execute_async(
-                "save_retry_task",
-                torrent_hash,
-                task_type,
-                hash_file_path,
-                retry_time,
-                retry_count,
-            )
-        except Exception as e:
-            self.logger.error(f"异步保存重试任务失败: {e}")
-
     def close(self):
         """关闭数据库管理器"""
         self.db_manager.stop()
