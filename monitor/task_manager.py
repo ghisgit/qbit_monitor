@@ -1,422 +1,267 @@
 import threading
 import time
 import logging
-from queue import Queue, Empty
-from typing import Set, Dict, Tuple
-from persistence.task_store import TaskStore
+import uuid
+from typing import List
+from persistence.task_store import TaskStore, Task
+from circuit_breaker.breaker import CircuitBreaker
+from circuit_breaker.health_checker import QBittorrentHealthChecker
+from retry_engine.infinite_retry import InfiniteRetryEngine
+from state_detector.detector import StateDetector
 
 
-class TaskWorkerManager:
-    """任务工作线程管理器"""
+class ResilientTaskManager:
+    """弹性任务管理器 - 支持无限重试和熔断保护"""
 
-    def __init__(self, event_handler, task_store: TaskStore, max_workers: int = 5):
+    def __init__(
+        self, event_handler, task_store: TaskStore, qbt_client, file_ops, config
+    ):
         self.event_handler = event_handler
         self.task_store = task_store
-        self.max_workers = max_workers
+        self.config = config
         self.logger = logging.getLogger(__name__)
 
-        # 任务队列和线程池
-        self.queues = {"added": Queue(), "completed": Queue()}
-        self.workers = {"added": set(), "completed": set()}
-        self.locks = {"added": threading.Lock(), "completed": threading.Lock()}
+        # 核心组件
+        self.circuit_breaker = CircuitBreaker(task_store)
+        self.health_checker = QBittorrentHealthChecker(qbt_client)
+        self.retry_engine = InfiniteRetryEngine()
+        self.state_detector = StateDetector(qbt_client, file_ops)
 
-        # 重试任务管理
-        self.retry_tasks: Dict[str, Tuple] = (
-            {}
-        )  # torrent_hash -> (task_type, hash_file_path, retry_time, retry_count)
-        self.retry_lock = threading.Lock()
-        self.retry_worker = None
-
-        # 线程控制
-        self.total_workers = 0
-        self.total_lock = threading.Lock()
+        # 工作线程管理
+        self.workers = []
         self.running = True
 
-    def start_retry_worker(self):
-        """启动重试工作线程"""
-        self.retry_worker = threading.Thread(
-            target=self._process_retry_tasks, name="retry_worker", daemon=False
-        )
-        self.retry_worker.start()
-        self.logger.info("重试工作线程已启动")
-
-    def _process_retry_tasks(self):
-        """处理重试任务"""
-        self.logger.debug("重试工作线程开始运行")
-
-        while self.running:
-            try:
-                current_time = time.time()
-                ready_tasks = []
-
-                # 检查哪些任务到了重试时间
-                with self.retry_lock:
-                    for torrent_hash, (
-                        task_type,
-                        hash_file_path,
-                        retry_time,
-                        retry_count,
-                    ) in list(self.retry_tasks.items()):
-                        if current_time >= retry_time:
-                            ready_tasks.append(
-                                (task_type, torrent_hash, hash_file_path, retry_count)
-                            )
-                            del self.retry_tasks[torrent_hash]
-
-                # 提交就绪的任务
-                for task_type, torrent_hash, hash_file_path, retry_count in ready_tasks:
-                    if retry_count >= 0:  # 最大重试次数
-                        self._safe_submit_task(task_type, torrent_hash, hash_file_path)
-                        self.logger.info(
-                            f"重试任务 ({retry_count}/无限): {torrent_hash}"
-                        )
-                    else:
-                        self.logger.warning(
-                            f"任务 {torrent_hash} 达到最大重试次数，放弃处理"
-                        )
-                        self._safe_delete_retry_task(torrent_hash, task_type)
-
-                # 等待下一次检查
-                for i in range(10):
-                    if not self.running:
-                        break
-                    time.sleep(0.1)
-
-            except Exception as e:
-                self.logger.error(f"重试工作线程错误: {e}")
-                time.sleep(5)
-
-        self.logger.debug("重试工作线程停止")
-
-    def _safe_submit_task(self, task_type: str, torrent_hash: str, hash_file_path: str):
-        """安全提交任务"""
-        try:
-            self.queues[task_type].put((torrent_hash, hash_file_path))
-            self._start_worker_if_needed(task_type)
-        except Exception as e:
-            self.logger.error(f"提交任务失败: {e}")
-
-    def _safe_delete_retry_task(self, torrent_hash: str, task_type: str):
-        """安全删除重试任务"""
-        try:
-            self.task_store.delete_retry_task(torrent_hash, task_type)
-        except Exception as e:
-            self.logger.error(f"删除重试任务失败: {e}")
-
-    def schedule_retry(
-        self, task_type: str, torrent_hash: str, hash_file_path: str, delay: int = 30
-    ):
-        """安排延迟重试 - 同步保存确保数据安全"""
-        retry_time = time.time() + delay
-
-        with self.retry_lock:
-            # 检查是否已有重试任务
-            existing_task = self.retry_tasks.get(torrent_hash)
-            if existing_task:
-                _, _, _, retry_count = existing_task
-                retry_count += 1
-            else:
-                # 新任务，从数据库获取当前计数
-                try:
-                    retry_count = (
-                        self.task_store.get_retry_count(torrent_hash, task_type) + 1
-                    )
-                except Exception as e:
-                    self.logger.warning(f"获取重试计数失败，使用默认值: {e}")
-                    retry_count = 1
-
-            # 关键修改：同步保存到数据库，确保持久化
-            try:
-                self.task_store.save_retry_task(
-                    torrent_hash, task_type, hash_file_path, retry_time, retry_count
-                )
-                # 只有数据库保存成功后才更新内存状态
-                self.retry_tasks[torrent_hash] = (
-                    task_type,
-                    hash_file_path,
-                    retry_time,
-                    retry_count,
-                )
-                self.logger.debug(
-                    f"安排 {delay} 秒后重试 ({retry_count}/5): {torrent_hash}"
-                )
-
-            except Exception as e:
-                self.logger.error(
-                    f"保存重试任务失败，不安排重试: {torrent_hash}, 错误: {e}"
-                )
-                # 保存失败，不安排重试，让任务留在主队列中等待下次处理
-                return False
-
-        return True
-
-    def load_retry_tasks(self):
-        """从数据库加载待重试任务"""
-        self.logger.info("加载待重试任务...")
-
-        try:
-            retry_tasks = self.task_store.get_pending_retry_tasks()
-            current_time = time.time()
-            loaded_count = 0
-
-            with self.retry_lock:
-                for (
-                    torrent_hash,
-                    task_type,
-                    hash_file_path,
-                    retry_time,
-                    retry_count,
-                ) in retry_tasks:
-                    # 如果重试时间已过，调整到近期重试
-                    if retry_time <= current_time:
-                        retry_time = current_time + 5
-                        # 更新数据库中的重试时间
-                        try:
-                            self.task_store.save_retry_task(
-                                torrent_hash,
-                                task_type,
-                                hash_file_path,
-                                retry_time,
-                                retry_count,
-                            )
-                        except Exception as e:
-                            self.logger.warning(
-                                f"更新重试时间失败: {torrent_hash}, 错误: {e}"
-                            )
-
-                    self.retry_tasks[torrent_hash] = (
-                        task_type,
-                        hash_file_path,
-                        retry_time,
-                        retry_count,
-                    )
-                    loaded_count += 1
-
-            self.logger.info(f"加载了 {loaded_count} 个待重试任务")
-
-        except Exception as e:
-            self.logger.error(f"加载重试任务失败: {e}")
-
-    def _save_pending_retry_tasks(self):
-        """保存未完成的重试任务到数据库 - 现在主要是为了日志记录"""
-        with self.retry_lock:
-            retry_count = len(self.retry_tasks)
-            if retry_count > 0:
-                self.logger.info(
-                    f"程序关闭，有 {retry_count} 个重试任务已在数据库中持久化"
-                )
-                # 由于每个重试任务在创建时都已同步保存，这里不需要额外操作
+        # 性能调节
+        self.batch_size = getattr(config, "batch_size", 5)
+        self.poll_interval = getattr(config, "poll_interval", 10)
+        self.max_workers = getattr(config, "max_workers", 3)
 
     def submit_task(
-        self,
-        task_type: str,
-        torrent_hash: str,
-        hash_file_path: str,
-        from_startup: bool = False,
-    ):
-        """提交任务"""
+        self, task_type: str, torrent_hash: str, hash_file_path: str
+    ) -> bool:
+        """提交新任务 - 原子性操作"""
         try:
-            if not from_startup:
-                # 新任务：先持久化，再清理文件
-                self.task_store.save_task(torrent_hash, task_type, hash_file_path)
-                self._cleanup_hash_file(hash_file_path)
+            # 生成唯一任务ID
+            task_uuid = str(uuid.uuid4())
 
-            self.queues[task_type].put((torrent_hash, hash_file_path))
-            self.logger.debug(f"提交{task_type}任务: {torrent_hash}")
-            self._start_worker_if_needed(task_type)
+            # 创建任务对象
+            current_time = time.time()
+            task = Task(
+                task_uuid=task_uuid,
+                torrent_hash=torrent_hash,
+                task_type=task_type,
+                status="pending",
+                hash_file_path=hash_file_path,
+                created_time=current_time,
+                updated_time=current_time,
+            )
+
+            # 保存到数据库
+            success = self.task_store.save_task(task)
+
+            if success:
+                self.logger.info(f"任务提交成功: {task_type} - {torrent_hash}")
+
+                # 只有数据库保存成功后才清理文件
+                self._cleanup_hash_file(hash_file_path)
+                return True
+            else:
+                self.logger.error(f"任务提交失败: {task_type} - {torrent_hash}")
+                return False
 
         except Exception as e:
-            self.logger.error(f"提交{task_type}任务失败: {e}")
-
-    def load_pending_tasks(self):
-        """加载待处理任务"""
-        self.logger.info("加载待处理任务...")
-
-        for task_type in ["added", "completed"]:
-            tasks = self.task_store.get_pending_tasks(task_type)
-            for torrent_hash, _, hash_file_path in tasks:
-                self.queues[task_type].put((torrent_hash, hash_file_path))
-                self.logger.debug(f"加载{task_type}任务: {torrent_hash}")
-
-            self.logger.info(f"加载{task_type}任务: {len(tasks)}个")
+            self.logger.error(f"任务提交异常: {torrent_hash}, 错误: {e}")
+            return False
 
     def start_all_workers(self):
         """启动所有工作线程"""
-        for task_type in ["added", "completed"]:
-            self._start_worker_if_needed(task_type)
+        for i in range(self.max_workers):
+            worker = threading.Thread(
+                target=self._database_polling_worker,
+                name=f"task_worker_{i}",
+                daemon=False,
+            )
+            self.workers.append(worker)
+            worker.start()
+
+        self.logger.info(f"启动了 {self.max_workers} 个数据库轮询工作线程")
+
+    def _database_polling_worker(self):
+        """数据库轮询工作线程"""
+        thread_name = threading.current_thread().name
+
+        self.logger.debug(f"{thread_name} 开始运行")
+
+        while self.running:
+            try:
+                # 检查系统健康状态
+                if self.health_checker.should_pause_processing():
+                    self.logger.warning(f"{thread_name} 因系统不健康暂停处理")
+                    time.sleep(30)
+                    continue
+
+                # 检查熔断器状态
+                if not self.circuit_breaker.can_execute("qbit_api"):
+                    self.logger.debug(f"{thread_name} 因熔断器开启暂停处理")
+                    time.sleep(10)
+                    continue
+
+                # 根据健康状态调整批处理大小
+                speed_factor = self.health_checker.get_processing_speed_factor()
+                adjusted_batch_size = max(1, int(self.batch_size * speed_factor))
+
+                # 获取待处理任务
+                tasks = self.task_store.get_eligible_tasks(limit=adjusted_batch_size)
+
+                if tasks:
+                    self.logger.debug(f"{thread_name} 获取到 {len(tasks)} 个任务")
+
+                    # 处理任务
+                    for task in tasks:
+                        if not self.running:
+                            break
+                        self._process_single_task(task)
+
+                    # 快速处理下一批任务
+                    continue
+                else:
+                    # 没有任务，根据系统负载调整休眠时间
+                    sleep_time = self.poll_interval
+                    if speed_factor < 0.5:
+                        sleep_time *= 2  # 系统负载高时延长休眠
+
+                    time.sleep(sleep_time)
+
+            except Exception as e:
+                self.logger.error(f"{thread_name} 轮询处理失败: {e}")
+                self.circuit_breaker.record_failure("qbit_api")
+                time.sleep(self.poll_interval * 2)
+
+        self.logger.debug(f"{thread_name} 停止运行")
+
+    def _process_single_task(self, task: Task):
+        """处理单个任务 - 简化版"""
+        try:
+            # 检查任务是否仍然有效
+            is_valid, reason = self.state_detector.is_task_valid(task)
+
+            if not is_valid:
+                # 任务失效，检查是否需要归档
+                if self.state_detector.should_archive_task(task, reason):
+                    self.task_store.archive_task(task.task_uuid, reason)
+                    self.logger.info(f"任务已归档: {task.torrent_hash}, 原因: {reason}")
+                else:
+                    # 任务暂时无效但不归档，安排重试
+                    self.logger.warning(
+                        f"任务暂时无效，安排重试: {task.torrent_hash}, 原因: {reason}"
+                    )
+                    self._handle_retry(task, f"task_invalid:{reason}")
+                return
+
+            # 任务有效，执行处理
+            if task.task_type == "added":
+                result = self.event_handler.process_torrent_addition(
+                    task.torrent_hash, task.hash_file_path
+                )
+            else:  # completed
+                result = self.event_handler.process_torrent_completion(
+                    task.torrent_hash, task.hash_file_path
+                )
+
+            # 处理结果
+            if result == "success":
+                self._handle_success(task)
+            elif result == "retry_later":
+                self._handle_retry(task, "metadata_not_ready")
+            else:
+                self._handle_retry(task, "unknown_error")
+
+        except Exception as e:
+            self.logger.error(f"任务处理异常: {task.torrent_hash}, 错误: {e}")
+            self._handle_retry(task, f"processing_exception:{str(e)}")
+            self.circuit_breaker.record_failure("qbit_api")
+
+    def _handle_success(self, task: Task):
+        """处理成功结果"""
+        try:
+            success = self.task_store.update_task_after_processing(
+                task_uuid=task.task_uuid, success=True
+            )
+
+            if success:
+                self.logger.info(f"任务处理成功: {task.torrent_hash}")
+                self.circuit_breaker.record_success("qbit_api")
+            else:
+                self.logger.error(f"更新任务状态失败: {task.torrent_hash}")
+
+        except Exception as e:
+            self.logger.error(f"处理成功结果失败: {task.torrent_hash}, 错误: {e}")
+
+    def _handle_retry(self, task: Task, failure_reason: str):
+        """处理重试结果"""
+        try:
+            # 计算下次重试时间
+            next_retry_time = self.retry_engine.calculate_next_retry(
+                task, failure_reason
+            )
+
+            if next_retry_time is None:
+                # 不应该继续重试，归档任务
+                self.task_store.archive_task(
+                    task.task_uuid, f"max_retries_reached:{failure_reason}"
+                )
+                self.logger.warning(f"任务达到最大重试次数: {task.torrent_hash}")
+            else:
+                # 安排重试
+                success = self.task_store.update_task_after_processing(
+                    task_uuid=task.task_uuid,
+                    success=False,
+                    failure_reason=failure_reason,
+                    error_message=failure_reason,
+                    next_retry_time=next_retry_time,
+                )
+
+                if success:
+                    self.logger.debug(
+                        f"任务安排重试: {task.torrent_hash}, 下次重试: {next_retry_time}"
+                    )
+                else:
+                    self.logger.error(f"安排重试失败: {task.torrent_hash}")
+
+        except Exception as e:
+            self.logger.error(f"处理重试结果失败: {task.torrent_hash}, 错误: {e}")
+
+    def _cleanup_hash_file(self, hash_file_path: str):
+        """清理哈希文件"""
+        import os
+
+        try:
+            if os.path.exists(hash_file_path):
+                os.remove(hash_file_path)
+                self.logger.debug(f"已删除哈希文件: {hash_file_path}")
+        except Exception as e:
+            self.logger.warning(f"删除哈希文件失败: {hash_file_path}, 错误: {e}")
 
     def stop_all_workers(self):
         """停止所有工作线程"""
         self.running = False
         self.logger.info("停止所有工作线程...")
 
-        # 记录重试任务状态（现在主要是日志记录）
-        self._save_pending_retry_tasks()
-
-        # 停止重试工作线程
-        if self.retry_worker and self.retry_worker.is_alive():
-            self.retry_worker.join(timeout=10)
-            self.logger.info("重试工作线程已停止")
-
-        # 停止其他工作线程
-        for task_type, queue in self.queues.items():
-            for _ in range(len(self.workers[task_type])):
-                queue.put(None)
-
-        for task_type, workers in self.workers.items():
-            for worker in list(workers):
+        for worker in self.workers:
+            if worker.is_alive():
                 worker.join(timeout=10)
 
         self.logger.info("所有工作线程已停止")
 
-    def _cleanup_hash_file(self, hash_file_path: str):
-        """清理哈希文件"""
-        import os
+    def get_system_status(self) -> dict:
+        """获取系统状态"""
+        health_status = self.health_checker.get_system_load_status()
 
-        if os.path.exists(hash_file_path):
-            os.remove(hash_file_path)
-            self.logger.debug(f"删除哈希文件: {hash_file_path}")
-
-    def _can_start_worker(self) -> bool:
-        """检查是否可以启动新线程"""
-        with self.total_lock:
-            return self.total_workers < self.max_workers
-
-    def _increment_total_workers(self):
-        """增加总线程计数"""
-        with self.total_lock:
-            self.total_workers += 1
-
-    def _decrement_total_workers(self):
-        """减少总线程计数"""
-        with self.total_lock:
-            self.total_workers -= 1
-
-    def _start_worker_if_needed(self, task_type: str):
-        """如果需要，启动工作线程"""
-        with self.locks[task_type]:
-            if (
-                not self.queues[task_type].empty()
-                and len(self.workers[task_type]) < self.max_workers - 1
-                and self._can_start_worker()
-            ):
-
-                worker = threading.Thread(
-                    target=self._process_tasks,
-                    args=(task_type,),
-                    name=f"{task_type}_worker_{len(self.workers[task_type])}",
-                    daemon=True,
-                )
-                self.workers[task_type].add(worker)
-                self._increment_total_workers()
-                worker.start()
-                self.logger.debug(
-                    f"启动{task_type}工作线程: {len(self.workers[task_type])}个"
-                )
-
-    def _process_tasks(self, task_type: str):
-        """处理任务的工作线程"""
-        thread_name = threading.current_thread().name
-
-        while self.running:
-            try:
-                event = self.queues[task_type].get(timeout=5)
-                if event is None:  # 停止信号
-                    break
-
-                torrent_hash, hash_file_path = event
-                self.logger.debug(f"{thread_name} 处理{task_type}任务: {torrent_hash}")
-
-                # 处理任务
-                success = self._process_single_task(
-                    task_type, torrent_hash, hash_file_path
-                )
-
-                if success:
-                    # 任务完成，从存储中删除
-                    self.task_store.delete_task(torrent_hash, task_type)
-                else:
-                    # 处理失败，重新加入队列
-                    self.logger.debug(
-                        f"{task_type}任务处理失败，重新加入队列: {torrent_hash}"
-                    )
-                    self.queues[task_type].put((torrent_hash, hash_file_path))
-
-                self.queues[task_type].task_done()
-
-            except Empty:
-                if self.queues[task_type].empty():
-                    break
-            except Exception as e:
-                self.logger.error(f"{thread_name} 处理{task_type}任务时发生错误: {e}")
-                time.sleep(1)
-
-        # 清理工作线程
-        with self.locks[task_type]:
-            self.workers[task_type].discard(threading.current_thread())
-            self._decrement_total_workers()
-            self.logger.debug(f"{task_type}工作线程停止: {thread_name}")
-
-    def _process_single_task(
-        self, task_type: str, torrent_hash: str, hash_file_path: str
-    ) -> bool:
-        """处理单个任务"""
-        try:
-            if task_type == "added":
-                result = self.event_handler.process_torrent_addition(
-                    torrent_hash, hash_file_path
-                )
-
-                if result == "retry_later":
-                    success = self.schedule_retry(
-                        task_type, torrent_hash, hash_file_path, delay=30
-                    )
-                    if not success:
-                        # 如果安排重试失败，将任务重新放入主队列
-                        self.logger.warning(
-                            f"安排重试失败，任务重新入队: {torrent_hash}"
-                        )
-                        self.queues[task_type].put((torrent_hash, hash_file_path))
-                    return True
-                elif result == "success":
-                    self._safe_delete_retry_task(torrent_hash, task_type)
-                    try:
-                        self.task_store.delete_task(torrent_hash, task_type)
-                    except Exception as e:
-                        self.logger.warning(f"删除任务失败: {e}")
-                    return True
-                else:
-                    return False
-
-            elif task_type == "completed":
-                result = self.event_handler.process_torrent_completion(
-                    torrent_hash, hash_file_path
-                )
-
-                if result == "retry_later":
-                    success = self.schedule_retry(
-                        task_type, torrent_hash, hash_file_path, delay=30
-                    )
-                    if not success:
-                        self.logger.warning(
-                            f"安排重试失败，任务重新入队: {torrent_hash}"
-                        )
-                        self.queues[task_type].put((torrent_hash, hash_file_path))
-                    return True
-                elif result == "success":
-                    self._safe_delete_retry_task(torrent_hash, task_type)
-                    try:
-                        self.task_store.delete_task(torrent_hash, task_type)
-                    except Exception as e:
-                        self.logger.warning(f"删除任务失败: {e}")
-                    return True
-                else:
-                    return False
-
-            return False
-
-        except Exception as e:
-            self.logger.error(
-                f"处理{task_type}任务时发生未捕获错误 {torrent_hash}: {e}"
-            )
-            return False
+        return {
+            "health_status": health_status,
+            "active_workers": len([w for w in self.workers if w.is_alive()]),
+            "running": self.running,
+            "circuit_breakers": {
+                "qbit_api": self.circuit_breaker.can_execute("qbit_api")
+            },
+        }

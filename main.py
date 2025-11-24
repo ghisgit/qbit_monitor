@@ -6,20 +6,29 @@ import os
 from pathlib import Path
 
 from config.settings import Config
-from config.paths import ADDED_TORRENTS_DIR, COMPLETED_TORRENTS_DIR, LOG_FILE, DB_FILE
+from config.paths import (
+    ADDED_TORRENTS_DIR,
+    COMPLETED_TORRENTS_DIR,
+    LOG_FILE,
+    DATA_FILE,
+    ensure_directories,
+)
 from utils.logging import setup_logging
 from core.qbittorrent import QBittorrentClient
 from core.file_operations import FileOperations
 from core.events import EventHandler
 from monitor.directory_monitor import DirectoryMonitor
-from monitor.task_manager import TaskWorkerManager
+from monitor.task_manager import ResilientTaskManager
 from persistence.task_store import TaskStore
 
 
 class QBitMonitor:
-    """qBittorrent 监控器主类"""
+    """增强的qBittorrent监控器 - 永不丢失架构"""
 
     def __init__(self):
+        # 首先确保所有目录都存在
+        ensure_directories()
+
         self.config = Config()
         setup_logging(LOG_FILE, self.config.debug_mode)
         self.logger = logging.getLogger(__name__)
@@ -34,81 +43,38 @@ class QBitMonitor:
         self.config.load_config()
 
         # 核心组件
-        self.task_store = TaskStore(DB_FILE)
+        self.task_store = TaskStore(DATA_FILE)
         self.qbt_client = QBittorrentClient(self.config.host, self.config.port)
         self.file_ops = FileOperations(self.config)
         self.event_handler = EventHandler(self.qbt_client, self.file_ops, self.config)
 
-        # 管理组件
-        self.task_manager = TaskWorkerManager(
-            self.event_handler,
-            self.task_store,
-            max_workers=getattr(self.config, "max_workers", 5),
+        # 弹性任务管理器
+        self.task_manager = ResilientTaskManager(
+            event_handler=self.event_handler,
+            task_store=self.task_store,
+            qbt_client=self.qbt_client,
+            file_ops=self.file_ops,
+            config=self.config,
         )
 
+        # 目录监控器
         self.directory_monitor = DirectoryMonitor(
-            self.event_handler,
-            ADDED_TORRENTS_DIR,
-            COMPLETED_TORRENTS_DIR,
-            self.task_manager,
-            self.task_store,
+            event_handler=self.event_handler,
+            added_dir=ADDED_TORRENTS_DIR,
+            completed_dir=COMPLETED_TORRENTS_DIR,
+            task_manager=self.task_manager,
+            task_store=self.task_store,
         )
-
-    def _safe_scan_existing_hash_files(self):
-        """安全扫描现有哈希文件"""
-        self.logger.info("安全扫描监控目录中的哈希文件...")
-
-        added_count = 0
-        completed_count = 0
-
-        try:
-            # 扫描添加目录
-            for hash_file in ADDED_TORRENTS_DIR.glob("*.hash"):
-                if self._process_hash_file(hash_file, "added"):
-                    added_count += 1
-
-            # 扫描完成目录
-            for hash_file in COMPLETED_TORRENTS_DIR.glob("*.hash"):
-                if self._process_hash_file(hash_file, "completed"):
-                    completed_count += 1
-
-            self.logger.info(
-                f"安全扫描完成: {added_count}个添加文件, {completed_count}个完成文件"
-            )
-
-        except Exception as e:
-            self.logger.error(f"安全扫描哈希文件失败: {e}")
-
-    def _process_hash_file(self, hash_file: Path, task_type: str) -> bool:
-        """处理单个哈希文件"""
-        torrent_hash = hash_file.stem
-        hash_file_path = str(hash_file)
-
-        if not self.task_store.task_exists(torrent_hash, task_type):
-            self.task_store.save_task(torrent_hash, task_type, hash_file_path)
-            self._cleanup_hash_file(hash_file_path)
-
-            self.task_manager.submit_task(
-                task_type, torrent_hash, hash_file_path, from_startup=True
-            )
-            return True
-
-        return False
-
-    def _cleanup_hash_file(self, hash_file_path: str):
-        """清理哈希文件"""
-        if os.path.exists(hash_file_path):
-            os.remove(hash_file_path)
-            self.logger.debug(f"删除哈希文件: {hash_file_path}")
 
     def start(self):
         """启动监控器"""
         self.running = True
         self._setup_signal_handlers()
 
+        # 等待qBittorrent启动
         self.qbt_client.wait_for_qbit()
 
-        self.logger.info("qBittorrent 监控器启动")
+        self.logger.info("qBittorrent监控器启动 - 永不丢失架构")
         self.logger.info(f"最大工作线程数: {self.task_manager.max_workers}")
 
         # 安全启动流程
@@ -124,33 +90,66 @@ class QBitMonitor:
 
     def _start_safely(self):
         """安全启动流程"""
-        # 1. 加载数据库中的任务
-        self.task_manager.load_pending_tasks()
-
-        # 2. 加载待重试任务
-        self.task_manager.load_retry_tasks()
-
-        # 3. 立即启动事件监控
+        # 1. 启动事件监控
         self.logger.info("启动事件监控...")
         self.directory_monitor.start()
         self.logger.info("事件监控已启动")
 
-        # 4. 安全扫描目录文件
+        # 2. 安全扫描目录文件（确保不会重复提交）
         self._safe_scan_existing_hash_files()
 
-        # 5. 启动工作线程
+        # 3. 启动工作线程
         self.task_manager.start_all_workers()
 
-        # 6. 启动重试工作线程
-        self.task_manager.start_retry_worker()
-
         self.logger.info("所有启动任务加载完成，开始处理...")
+
+    def _safe_scan_existing_hash_files(self):
+        """安全扫描现有哈希文件"""
+        self.logger.info("安全扫描监控目录中的哈希文件...")
+
+        added_count = 0
+        completed_count = 0
+
+        try:
+            # 扫描添加目录
+            for hash_file in ADDED_TORRENTS_DIR.glob("*.hash"):
+                success = self.task_manager.submit_task(
+                    "added", hash_file.stem, str(hash_file)
+                )
+                if success:
+                    added_count += 1
+                else:
+                    self.logger.warning(f"扫描提交失败: added - {hash_file.stem}")
+
+            # 扫描完成目录
+            for hash_file in COMPLETED_TORRENTS_DIR.glob("*.hash"):
+                success = self.task_manager.submit_task(
+                    "completed", hash_file.stem, str(hash_file)
+                )
+                if success:
+                    completed_count += 1
+                else:
+                    self.logger.warning(f"扫描提交失败: completed - {hash_file.stem}")
+
+            self.logger.info(
+                f"安全扫描完成: {added_count}个添加文件, {completed_count}个完成文件"
+            )
+
+        except Exception as e:
+            self.logger.error(f"安全扫描哈希文件失败: {e}")
 
     def _run_main_loop(self):
         """运行主循环"""
         try:
             while self.running:
+                # 定期重新加载配置
                 self.config.load_config()
+
+                # 输出系统状态（可选）
+                if self.config.debug_mode:
+                    status = self.task_manager.get_system_status()
+                    self.logger.debug(f"系统状态: {status}")
+
                 time.sleep(self.config.check_interval)
 
         except KeyboardInterrupt:
@@ -166,11 +165,10 @@ class QBitMonitor:
         self.directory_monitor.stop()
         self.task_manager.stop_all_workers()
 
-        # 关闭数据库管理器
-        if hasattr(self, "task_store"):
-            self.task_store.close()
+        # 关闭数据库连接
+        self.task_store.close()
 
-        self.logger.info("qBittorrent 监控器已停止")
+        self.logger.info("qBittorrent监控器已停止")
 
     def signal_handler(self, signum, frame):
         """信号处理函数"""

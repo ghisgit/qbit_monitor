@@ -1,403 +1,532 @@
 import sqlite3
 import logging
 import threading
-from pathlib import Path
-from typing import List, Tuple, Dict, Any, Optional
 import time
-from queue import Queue, Empty
 import json
+import uuid
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Tuple
+from dataclasses import dataclass
+from contextlib import contextmanager
+from config.paths import DATA_DIR, DATA_FILE
 
 
-class DatabaseManager:
-    """数据库管理线程"""
+@dataclass
+class Task:
+    task_uuid: str
+    torrent_hash: str
+    task_type: str
+    status: str
+    hash_file_path: str
+    retry_count: int = 0
+    failure_reason: str = None
+    next_retry_time: float = None
+    circuit_state: str = "closed"
+    created_time: float = None
+    updated_time: float = None
+    last_attempt_time: float = None
+    last_success_time: float = None
+    current_phase: str = None
+
+
+@dataclass
+class CircuitBreakerConfig:
+    failure_threshold: int = 5
+    success_threshold: int = 3
+    timeout: int = 60
+    half_open_timeout: int = 30
+
+
+@dataclass
+class RetryStrategy:
+    base_delay: int
+    max_delay: int = None
+    backoff_multiplier: float = 2.0
+    jitter_factor: float = 0.1
+    max_retries: int = None  # None表示无限重试
+
+
+class ThreadLocalConnection:
+    """线程本地数据库连接管理"""
 
     def __init__(self, db_path: str):
-        self.db_path = Path(db_path)
-        self.logger = logging.getLogger(__name__)
+        self.db_path = db_path
+        self.local = threading.local()
 
-        # 命令队列
-        self.command_queue = Queue()
-        self.result_queues: Dict[str, Queue] = {}
-        self.result_lock = threading.Lock()
-
-        # 线程控制
-        self.running = True
-        self.worker_thread = None
-
-        # 初始化数据库
-        self._init_database()
-        self._start_worker()
-
-    def _init_database(self):
-        """初始化数据库结构"""
-        conn = sqlite3.connect(self.db_path, timeout=30.0)
-        try:
-            cursor = conn.cursor()
-
-            # 主任务表
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS tasks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    torrent_hash TEXT NOT NULL,
-                    task_type TEXT NOT NULL,
-                    hash_file_path TEXT NOT NULL,
-                    created_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(torrent_hash, task_type)
-                )
-            """
+    def get_connection(self) -> sqlite3.Connection:
+        if not hasattr(self.local, "connection"):
+            self.local.connection = sqlite3.connect(
+                self.db_path, timeout=30.0, check_same_thread=False
             )
+            # 优化配置
+            self.local.connection.execute("PRAGMA journal_mode=WAL")
+            self.local.connection.execute("PRAGMA synchronous=NORMAL")
+            self.local.connection.execute("PRAGMA cache_size=-64000")
+        return self.local.connection
 
-            # 重试任务表
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS retry_tasks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    torrent_hash TEXT NOT NULL,
-                    task_type TEXT NOT NULL,
-                    hash_file_path TEXT NOT NULL,
-                    retry_time REAL NOT NULL,
-                    retry_count INTEGER DEFAULT 0,
-                    created_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(torrent_hash, task_type)
-                )
-            """
-            )
-
-            # 创建索引
-            cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_hash_type ON tasks(torrent_hash, task_type)"
-            )
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_type ON tasks(task_type)")
-            cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_retry_time ON retry_tasks(retry_time)"
-            )
-            cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_retry_hash_type ON retry_tasks(torrent_hash, task_type)"
-            )
-
-            conn.commit()
-            self.logger.info("数据库初始化完成")
-
-        finally:
-            conn.close()
-
-    def _start_worker(self):
-        """启动数据库工作线程"""
-        self.worker_thread = threading.Thread(
-            target=self._database_worker, name="database_worker", daemon=False
-        )
-        self.worker_thread.start()
-        self.logger.info("数据库管理线程已启动")
-
-    def _database_worker(self):
-        """数据库工作线程主循环"""
-        conn = sqlite3.connect(self.db_path, timeout=30.0)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA cache_size=-64000")
-
-        self.logger.debug("数据库工作线程开始运行")
-
-        while self.running:
+    def close_all(self):
+        if hasattr(self.local, "connection"):
             try:
-                # 获取命令，超时1秒以便检查运行状态
-                command = self.command_queue.get(timeout=1.0)
-                command_type, command_id, method, args, kwargs = command
-
-                try:
-                    # 执行数据库操作
-                    result = self._execute_method(conn, method, *args, **kwargs)
-
-                    # 发送结果
-                    with self.result_lock:
-                        if command_id in self.result_queues:
-                            self.result_queues[command_id].put(("success", result))
-
-                except Exception as e:
-                    self.logger.error(f"数据库操作失败 {method}: {e}")
-
-                    # 发送错误
-                    with self.result_lock:
-                        if command_id in self.result_queues:
-                            self.result_queues[command_id].put(("error", str(e)))
-
-                finally:
-                    self.command_queue.task_done()
-
-            except Empty:
-                # 超时，继续循环检查运行状态
-                continue
-            except Exception as e:
-                self.logger.error(f"数据库工作线程错误: {e}")
-                time.sleep(0.1)
-
-        # 清理
-        conn.close()
-        self.logger.debug("数据库工作线程停止")
-
-    def _execute_method(self, conn, method: str, *args, **kwargs):
-        """执行具体的数据库方法"""
-        if method == "save_task":
-            return self._save_task(conn, *args, **kwargs)
-        elif method == "save_retry_task":
-            return self._save_retry_task(conn, *args, **kwargs)
-        elif method == "get_pending_retry_tasks":
-            return self._get_pending_retry_tasks(conn, *args, **kwargs)
-        elif method == "delete_retry_task":
-            return self._delete_retry_task(conn, *args, **kwargs)
-        elif method == "get_pending_tasks":
-            return self._get_pending_tasks(conn, *args, **kwargs)
-        elif method == "task_exists":
-            return self._task_exists(conn, *args, **kwargs)
-        elif method == "delete_task":
-            return self._delete_task(conn, *args, **kwargs)
-        elif method == "get_retry_count":
-            return self._get_retry_count(conn, *args, **kwargs)
-        elif method == "cleanup_orphaned_tasks":
-            return self._cleanup_orphaned_tasks(conn, *args, **kwargs)
-        else:
-            raise ValueError(f"未知的数据库方法: {method}")
-
-    def _execute_query(self, conn, query: str, params: tuple = ()):
-        """执行查询并返回结果"""
-        cursor = conn.cursor()
-        cursor.execute(query, params)
-        return cursor.fetchall()
-
-    def _execute_update(self, conn, query: str, params: tuple = ()):
-        """执行更新操作"""
-        cursor = conn.cursor()
-        cursor.execute(query, params)
-        conn.commit()
-        return cursor.rowcount
-
-    # 具体的数据库操作方法
-    def _save_task(self, conn, torrent_hash: str, task_type: str, hash_file_path: str):
-        self._execute_update(
-            conn,
-            "INSERT OR REPLACE INTO tasks (torrent_hash, task_type, hash_file_path) VALUES (?, ?, ?)",
-            (torrent_hash, task_type, hash_file_path),
-        )
-
-    def _save_retry_task(
-        self,
-        conn,
-        torrent_hash: str,
-        task_type: str,
-        hash_file_path: str,
-        retry_time: float,
-        retry_count: int,
-    ):
-        self._execute_update(
-            conn,
-            "INSERT OR REPLACE INTO retry_tasks (torrent_hash, task_type, hash_file_path, retry_time, retry_count) VALUES (?, ?, ?, ?, ?)",
-            (torrent_hash, task_type, hash_file_path, retry_time, retry_count),
-        )
-
-    def _get_pending_retry_tasks(self, conn):
-        return self._execute_query(
-            conn,
-            "SELECT torrent_hash, task_type, hash_file_path, retry_time, retry_count FROM retry_tasks ORDER BY retry_time",
-        )
-
-    def _delete_retry_task(self, conn, torrent_hash: str, task_type: str):
-        return self._execute_update(
-            conn,
-            "DELETE FROM retry_tasks WHERE torrent_hash = ? AND task_type = ?",
-            (torrent_hash, task_type),
-        )
-
-    def _get_pending_tasks(self, conn, task_type: str = None):
-        if task_type:
-            return self._execute_query(
-                conn,
-                "SELECT torrent_hash, task_type, hash_file_path FROM tasks WHERE task_type = ? ORDER BY created_time",
-                (task_type,),
-            )
-        else:
-            return self._execute_query(
-                conn,
-                "SELECT torrent_hash, task_type, hash_file_path FROM tasks ORDER BY created_time",
-            )
-
-    def _task_exists(self, conn, torrent_hash: str, task_type: str):
-        result = self._execute_query(
-            conn,
-            "SELECT 1 FROM tasks WHERE torrent_hash = ? AND task_type = ?",
-            (torrent_hash, task_type),
-        )
-        return len(result) > 0
-
-    def _delete_task(self, conn, torrent_hash: str, task_type: str):
-        return self._execute_update(
-            conn,
-            "DELETE FROM tasks WHERE torrent_hash = ? AND task_type = ?",
-            (torrent_hash, task_type),
-        )
-
-    def _get_retry_count(self, conn, torrent_hash: str, task_type: str):
-        result = self._execute_query(
-            conn,
-            "SELECT retry_count FROM retry_tasks WHERE torrent_hash = ? AND task_type = ?",
-            (torrent_hash, task_type),
-        )
-        return result[0][0] if result else 0
-
-    def _cleanup_orphaned_tasks(self, conn):
-        return self._execute_update(
-            conn,
-            "DELETE FROM tasks WHERE hash_file_path IS NULL OR hash_file_path = ''",
-        )
-
-    def execute_command(self, method: str, *args, **kwargs) -> Any:
-        """执行数据库命令并等待结果"""
-        command_id = threading.current_thread().name + str(time.time())
-        result_queue = Queue()
-
-        with self.result_lock:
-            self.result_queues[command_id] = result_queue
-
-        try:
-            # 发送命令
-            self.command_queue.put(("command", command_id, method, args, kwargs))
-
-            # 等待结果
-            status, result = result_queue.get(timeout=30.0)
-
-            if status == "success":
-                return result
-            else:
-                raise Exception(f"数据库操作失败: {result}")
-
-        finally:
-            # 清理结果队列
-            with self.result_lock:
-                if command_id in self.result_queues:
-                    del self.result_queues[command_id]
-
-    def execute_async(self, method: str, *args, **kwargs):
-        """异步执行数据库命令（不等待结果）"""
-        command_id = "async_" + str(time.time())
-        self.command_queue.put(("async", command_id, method, args, kwargs))
-
-    def stop(self):
-        """停止数据库管理线程"""
-        self.running = False
-        if self.worker_thread and self.worker_thread.is_alive():
-            self.worker_thread.join(timeout=10)
-            self.logger.info("数据库管理线程已停止")
+                self.local.connection.close()
+            except:
+                pass
+            delattr(self.local, "connection")
 
 
 class TaskStore:
-    """任务存储管理器（线程安全版本）"""
+    """增强的任务存储管理器"""
 
-    def __init__(self, db_path: str = "tasks.db"):
+    def __init__(self, db_path: str = DATA_FILE):
         self.db_path = Path(db_path)
-        self.logger = logging.getLogger(__name__)
-        self.db_manager = DatabaseManager(str(self.db_path))
 
-    def save_task(self, torrent_hash: str, task_type: str, hash_file_path: str):
-        """保存任务"""
-        try:
-            self.db_manager.execute_command(
-                "save_task", torrent_hash, task_type, hash_file_path
+        # 确保数据库目录存在
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self.logger = logging.getLogger(__name__)
+        self.connection_manager = ThreadLocalConnection(str(self.db_path))
+        self._init_database()
+
+    def _init_database(self):
+        """初始化数据库表结构"""
+        conn = self.connection_manager.get_connection()
+        cursor = conn.cursor()
+
+        # 主任务表
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_uuid TEXT UNIQUE NOT NULL,
+                torrent_hash TEXT NOT NULL,
+                task_type TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                current_phase TEXT,
+                retry_count INTEGER DEFAULT 0,
+                failure_reason TEXT,
+                next_retry_time REAL,
+                circuit_state TEXT DEFAULT 'closed',
+                created_time REAL NOT NULL,
+                updated_time REAL NOT NULL,
+                last_attempt_time REAL,
+                last_success_time REAL,
+                hash_file_path TEXT NOT NULL,
+                
+                CHECK (status IN ('pending', 'processing', 'completed', 'archived', 'waiting'))
             )
-            self.logger.debug(f"保存任务: {task_type} - {torrent_hash}")
+        """
+        )
+
+        # 任务事件表
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS task_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_uuid TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                event_data TEXT,
+                created_time REAL NOT NULL,
+                FOREIGN KEY (task_uuid) REFERENCES tasks(task_uuid)
+            )
+        """
+        )
+
+        # 熔断状态表
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS circuit_break_status (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                breaker_type TEXT UNIQUE NOT NULL,
+                state TEXT NOT NULL,
+                failure_count INTEGER DEFAULT 0,
+                success_count INTEGER DEFAULT 0,
+                last_state_change REAL NOT NULL,
+                last_failure_time REAL,
+                last_success_time REAL,
+                config TEXT,
+                created_time REAL NOT NULL,
+                updated_time REAL NOT NULL
+            )
+        """
+        )
+
+        # 检查点表
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS checkpoints (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_uuid TEXT NOT NULL,
+                phase_name TEXT NOT NULL,
+                checkpoint_data TEXT,
+                created_time REAL NOT NULL,
+                FOREIGN KEY (task_uuid) REFERENCES tasks(task_uuid),
+                UNIQUE(task_uuid, phase_name)
+            )
+        """
+        )
+
+        # 创建索引
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_tasks_status_retry 
+            ON tasks(status, next_retry_time) 
+            WHERE status IN ('pending', 'waiting')
+        """
+        )
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_tasks_circuit 
+            ON tasks(circuit_state, status)
+        """
+        )
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_tasks_hash_type 
+            ON tasks(torrent_hash, task_type)
+        """
+        )
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_events_task 
+            ON task_events(task_uuid, created_time)
+        """
+        )
+
+        conn.commit()
+        self.logger.info("数据库初始化完成")
+
+    @contextmanager
+    def transaction(self):
+        """事务上下文管理器"""
+        conn = self.connection_manager.get_connection()
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    def save_task(self, task: Task) -> bool:
+        """保存任务到数据库"""
+        try:
+            with self.transaction() as conn:
+                cursor = conn.cursor()
+
+                cursor.execute(
+                    """
+                    INSERT OR REPLACE INTO tasks (
+                        task_uuid, torrent_hash, task_type, status, hash_file_path,
+                        retry_count, failure_reason, next_retry_time, circuit_state,
+                        created_time, updated_time, last_attempt_time, last_success_time,
+                        current_phase
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                    (
+                        task.task_uuid,
+                        task.torrent_hash,
+                        task.task_type,
+                        task.status,
+                        task.hash_file_path,
+                        task.retry_count,
+                        task.failure_reason,
+                        task.next_retry_time,
+                        task.circuit_state,
+                        task.created_time,
+                        task.updated_time,
+                        task.last_attempt_time,
+                        task.last_success_time,
+                        task.current_phase,
+                    ),
+                )
+
+                # 记录创建事件
+                cursor.execute(
+                    """
+                    INSERT INTO task_events (task_uuid, event_type, event_data, created_time)
+                    VALUES (?, ?, ?, ?)
+                """,
+                    (
+                        task.task_uuid,
+                        "created",
+                        json.dumps({"hash_file_path": task.hash_file_path}),
+                        time.time(),
+                    ),
+                )
+
+            return True
+
         except Exception as e:
             self.logger.error(f"保存任务失败: {e}")
-            raise
+            return False
 
-    def save_retry_task(
-        self,
-        torrent_hash: str,
-        task_type: str,
-        hash_file_path: str,
-        retry_time: float,
-        retry_count: int,
-    ):
-        """保存重试任务"""
+    def get_eligible_tasks(self, limit: int = 10) -> List[Task]:
+        """获取符合条件的待处理任务"""
         try:
-            self.db_manager.execute_command(
-                "save_retry_task",
-                torrent_hash,
-                task_type,
-                hash_file_path,
-                retry_time,
-                retry_count,
-            )
-            self.logger.debug(
-                f"保存重试任务: {task_type} - {torrent_hash}, 重试次数: {retry_count}"
-            )
-        except Exception as e:
-            self.logger.error(f"保存重试任务失败: {e}")
-            raise
+            with self.transaction() as conn:
+                cursor = conn.cursor()
 
-    def get_pending_retry_tasks(self) -> List[Tuple]:
-        """获取待处理的重试任务"""
-        try:
-            return self.db_manager.execute_command("get_pending_retry_tasks")
-        except Exception as e:
-            self.logger.error(f"获取重试任务失败: {e}")
-            return []
+                cursor.execute(
+                    """
+                    SELECT * FROM tasks 
+                    WHERE status IN ('pending', 'waiting')
+                    AND circuit_state = 'closed'
+                    AND (next_retry_time IS NULL OR next_retry_time <= ?)
+                    ORDER BY 
+                        CASE failure_reason 
+                            WHEN 'metadata_not_ready' THEN 1
+                            WHEN 'qbit_api_error' THEN 2
+                            ELSE 3 
+                        END,
+                        retry_count ASC,
+                        created_time ASC
+                    LIMIT ?
+                """,
+                    (time.time(), limit),
+                )
 
-    def delete_retry_task(self, torrent_hash: str, task_type: str):
-        """删除重试任务"""
-        try:
-            self.db_manager.execute_command(
-                "delete_retry_task", torrent_hash, task_type
-            )
-            self.logger.debug(f"删除重试任务: {task_type} - {torrent_hash}")
-        except Exception as e:
-            self.logger.error(f"删除重试任务失败: {e}")
-            raise
+                tasks = []
+                for row in cursor.fetchall():
+                    task = self._row_to_task(
+                        dict(zip([col[0] for col in cursor.description], row))
+                    )
+                    tasks.append(task)
 
-    def get_pending_tasks(self, task_type: str = None) -> List[Tuple[str, str, str]]:
-        """获取待处理任务"""
-        try:
-            return self.db_manager.execute_command("get_pending_tasks", task_type)
+                # 标记任务为处理中
+                for task in tasks:
+                    cursor.execute(
+                        """
+                        UPDATE tasks 
+                        SET status = 'processing', last_attempt_time = ?, updated_time = ?
+                        WHERE task_uuid = ?
+                    """,
+                        (time.time(), time.time(), task.task_uuid),
+                    )
+
+                    cursor.execute(
+                        """
+                        INSERT INTO task_events (task_uuid, event_type, event_data, created_time)
+                        VALUES (?, ?, ?, ?)
+                    """,
+                        (
+                            task.task_uuid,
+                            "processing_started",
+                            json.dumps({"batch_size": limit}),
+                            time.time(),
+                        ),
+                    )
+
+                return tasks
+
         except Exception as e:
             self.logger.error(f"获取待处理任务失败: {e}")
             return []
 
-    def task_exists(self, torrent_hash: str, task_type: str) -> bool:
-        """检查任务是否存在"""
+    def update_task_after_processing(
+        self,
+        task_uuid: str,
+        success: bool,
+        failure_reason: str = None,
+        error_message: str = None,
+        next_retry_time: float = None,
+    ) -> bool:
+        """更新任务处理结果"""
         try:
-            return self.db_manager.execute_command(
-                "task_exists", torrent_hash, task_type
-            )
+            with self.transaction() as conn:
+                cursor = conn.cursor()
+
+                if success:
+                    cursor.execute(
+                        """
+                        UPDATE tasks 
+                        SET status = 'completed', 
+                            last_success_time = ?,
+                            updated_time = ?
+                        WHERE task_uuid = ?
+                    """,
+                        (time.time(), time.time(), task_uuid),
+                    )
+
+                    cursor.execute(
+                        """
+                        INSERT INTO task_events (task_uuid, event_type, event_data, created_time)
+                        VALUES (?, ?, ?, ?)
+                    """,
+                        (task_uuid, "completed", "{}", time.time()),
+                    )
+
+                else:
+                    cursor.execute(
+                        """
+                        UPDATE tasks 
+                        SET status = 'waiting',
+                            retry_count = retry_count + 1,
+                            failure_reason = ?,
+                            next_retry_time = ?,
+                            updated_time = ?
+                        WHERE task_uuid = ?
+                    """,
+                        (failure_reason, next_retry_time, time.time(), task_uuid),
+                    )
+
+                    cursor.execute(
+                        """
+                        INSERT INTO task_events (task_uuid, event_type, event_data, created_time)
+                        VALUES (?, ?, ?, ?)
+                    """,
+                        (
+                            task_uuid,
+                            "retry_scheduled",
+                            json.dumps(
+                                {
+                                    "reason": failure_reason,
+                                    "next_retry": next_retry_time,
+                                    "retry_count": self._get_retry_count(
+                                        conn, task_uuid
+                                    )
+                                    + 1,
+                                }
+                            ),
+                            time.time(),
+                        ),
+                    )
+
+                return True
+
+        except Exception as e:
+            self.logger.error(f"更新任务状态失败: {e}")
+            return False
+
+    def archive_task(self, task_uuid: str, reason: str) -> bool:
+        """归档任务"""
+        try:
+            with self.transaction() as conn:
+                cursor = conn.cursor()
+
+                cursor.execute(
+                    """
+                    UPDATE tasks 
+                    SET status = 'archived', updated_time = ?
+                    WHERE task_uuid = ?
+                """,
+                    (time.time(), task_uuid),
+                )
+
+                cursor.execute(
+                    """
+                    INSERT INTO task_events (task_uuid, event_type, event_data, created_time)
+                    VALUES (?, ?, ?, ?)
+                """,
+                    (
+                        task_uuid,
+                        "archived",
+                        json.dumps({"reason": reason}),
+                        time.time(),
+                    ),
+                )
+
+                return True
+
+        except Exception as e:
+            self.logger.error(f"归档任务失败: {e}")
+            return False
+
+    def task_exists(self, torrent_hash: str, task_type: str) -> bool:
+        """检查任务是否存在 - 兼容性方法"""
+        try:
+            with self.transaction() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT 1 FROM tasks 
+                    WHERE torrent_hash = ? AND task_type = ?
+                    AND status != 'completed' AND status != 'archived'
+                """,
+                    (torrent_hash, task_type),
+                )
+
+                return cursor.fetchone() is not None
+
         except Exception as e:
             self.logger.error(f"检查任务存在性失败: {e}")
             return False
 
-    def delete_task(self, torrent_hash: str, task_type: str):
-        """删除任务"""
+    def get_pending_tasks(self, task_type: str = None) -> List[Tuple[str, str, str]]:
+        """获取待处理任务 - 兼容性方法"""
         try:
-            self.db_manager.execute_command("delete_task", torrent_hash, task_type)
-            self.logger.debug(f"删除任务: {task_type} - {torrent_hash}")
+            with self.transaction() as conn:
+                cursor = conn.cursor()
+
+                if task_type:
+                    cursor.execute(
+                        """
+                        SELECT torrent_hash, task_type, hash_file_path 
+                        FROM tasks 
+                        WHERE task_type = ? 
+                        AND status IN ('pending', 'waiting')
+                        ORDER BY created_time
+                    """,
+                        (task_type,),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        SELECT torrent_hash, task_type, hash_file_path 
+                        FROM tasks 
+                        WHERE status IN ('pending', 'waiting')
+                        ORDER BY created_time
+                    """
+                    )
+
+                return cursor.fetchall()
+
+        except Exception as e:
+            self.logger.error(f"获取待处理任务失败: {e}")
+            return []
+
+    def delete_task(self, torrent_hash: str, task_type: str):
+        """删除任务 - 兼容性方法"""
+        try:
+            with self.transaction() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    DELETE FROM tasks 
+                    WHERE torrent_hash = ? AND task_type = ?
+                """,
+                    (torrent_hash, task_type),
+                )
+
         except Exception as e:
             self.logger.error(f"删除任务失败: {e}")
             raise
 
-    def get_retry_count(self, torrent_hash: str, task_type: str) -> int:
-        """获取重试计数"""
-        try:
-            return self.db_manager.execute_command(
-                "get_retry_count", torrent_hash, task_type
-            )
-        except Exception as e:
-            self.logger.error(f"获取重试计数失败: {e}")
-            return 0
+    def _get_retry_count(self, conn, task_uuid: str) -> int:
+        """获取任务当前重试次数"""
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT retry_count FROM tasks WHERE task_uuid = ?", (task_uuid,)
+        )
+        result = cursor.fetchone()
+        return result[0] if result else 0
 
-    def cleanup_orphaned_tasks(self):
-        """清理孤立任务"""
-        try:
-            deleted_count = self.db_manager.execute_command("cleanup_orphaned_tasks")
-            if deleted_count > 0:
-                self.logger.info(f"清理了 {deleted_count} 个孤立任务")
-        except Exception as e:
-            self.logger.error(f"清理孤立任务失败: {e}")
+    def _row_to_task(self, row: Dict) -> Task:
+        """将数据库行转换为Task对象"""
+        return Task(
+            task_uuid=row["task_uuid"],
+            torrent_hash=row["torrent_hash"],
+            task_type=row["task_type"],
+            status=row["status"],
+            hash_file_path=row["hash_file_path"],
+            retry_count=row["retry_count"],
+            failure_reason=row["failure_reason"],
+            next_retry_time=row["next_retry_time"],
+            circuit_state=row["circuit_state"],
+            created_time=row["created_time"],
+            updated_time=row["updated_time"],
+            last_attempt_time=row["last_attempt_time"],
+            last_success_time=row["last_success_time"],
+            current_phase=row["current_phase"],
+        )
 
     def close(self):
-        """关闭数据库管理器"""
-        self.db_manager.stop()
+        """关闭数据库连接"""
+        self.connection_manager.close_all()

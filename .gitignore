@@ -1,5 +1,6 @@
-db/
+data/
 logs/
+tests/
 __pycache__/
 added_torrents/
 completed_torrents/

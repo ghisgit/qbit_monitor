@@ -1,10 +1,19 @@
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from config.paths import LOG_DIR, LOG_FILE
 
 
-def setup_logging(log_file: Path, debug_mode: bool = False):
+def setup_logging(log_file: Path = None, debug_mode: bool = False):
     """设置日志配置"""
+
+    # 如果没有指定日志文件，使用默认路径
+    if log_file is None:
+        log_file = LOG_FILE
+
+    # 确保日志目录存在
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
     log_level = logging.DEBUG if debug_mode else logging.INFO
 
     logger = logging.getLogger()
@@ -19,20 +28,23 @@ def setup_logging(log_file: Path, debug_mode: bool = False):
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
 
-    # 文件处理器 - 使用轮转日志
-    file_handler = RotatingFileHandler(
-        log_file, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"  # 10MB
-    )
-    file_handler.setLevel(log_level)
-    file_handler.setFormatter(formatter)
+    try:
+        # 文件处理器 - 使用轮转日志
+        file_handler = RotatingFileHandler(
+            log_file, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"  # 10MB
+        )
+        file_handler.setLevel(log_level)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
+    except Exception as e:
+        print(f"无法创建文件日志处理器: {e}")
+        # 如果文件日志失败，只使用控制台日志
 
     # 控制台处理器
     console_handler = logging.StreamHandler()
     console_handler.setLevel(log_level)
     console_handler.setFormatter(formatter)
-
-    # 添加处理器到日志器
-    logger.addHandler(file_handler)
     logger.addHandler(console_handler)
 
     # 记录初始日志

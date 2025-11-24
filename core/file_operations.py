@@ -113,3 +113,7 @@ class FileOperations:
                     break
         except Exception as e:
             self.logger.error(f"清理空目录时发生错误: {e}")
+
+    def path_exists(self, path: str) -> bool:
+        """检查路径是否存在"""
+        return os.path.exists(path)

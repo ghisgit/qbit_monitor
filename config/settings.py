@@ -41,7 +41,8 @@ class Config:
             "disable_before_delete": True,
             "disable_delay": 1,
             "max_workers": 5,
-            "queue_size": 1000,
+            "batch_size": 10,
+            "poll_interval": 10,
         }
 
     def load_config(self) -> bool:
@@ -130,5 +131,9 @@ class Config:
         return self._config["max_workers"]
 
     @property
-    def queue_size(self) -> int:
-        return self._config["queue_size"]
+    def batch_size(self) -> int:
+        return self._config["batch_size"]
+
+    @property
+    def poll_interval(self) -> int:
+        return self._config["poll_interval"]
