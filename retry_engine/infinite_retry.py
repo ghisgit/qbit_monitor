@@ -44,27 +44,3 @@ class InfiniteRetryEngine:
     def list_all_strategies(self):
         """列出所有可用策略"""
         return self.strategy_manager.list_strategies()
-
-    def add_custom_strategy(self, name: str, config_dict: Dict):
-        """添加自定义策略（简化接口）"""
-        from .strategies import RetryStrategyConfig, RetryStrategyType
-
-        try:
-            config = RetryStrategyConfig(
-                name=name,
-                strategy_type=RetryStrategyType(
-                    config_dict.get("strategy_type", "exponential_backoff")
-                ),
-                base_delay=config_dict.get("base_delay", 60),
-                max_delay=config_dict.get("max_delay", 300),
-                max_retries=config_dict.get("max_retries"),
-                backoff_multiplier=config_dict.get("backoff_multiplier", 2.0),
-                jitter_factor=config_dict.get("jitter_factor", 0.1),
-            )
-
-            self.strategy_manager.add_custom_strategy(name, config)
-            return True
-
-        except Exception as e:
-            self.logger.error(f"添加自定义策略失败 {name}: {e}")
-            return False

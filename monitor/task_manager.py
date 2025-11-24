@@ -7,7 +7,6 @@ from persistence.task_store import TaskStore, Task
 from circuit_breaker.breaker import CircuitBreaker
 from circuit_breaker.health_checker import QBittorrentHealthChecker
 from retry_engine.infinite_retry import InfiniteRetryEngine
-from state_detector.detector import StateDetector
 
 
 class ResilientTaskManager:
@@ -25,7 +24,6 @@ class ResilientTaskManager:
         self.circuit_breaker = CircuitBreaker(task_store)
         self.health_checker = QBittorrentHealthChecker(qbt_client)
         self.retry_engine = InfiniteRetryEngine()
-        self.state_detector = StateDetector(qbt_client, file_ops)
 
         # 工作线程管理
         self.workers = []
@@ -140,25 +138,9 @@ class ResilientTaskManager:
         self.logger.debug(f"{thread_name} 停止运行")
 
     def _process_single_task(self, task: Task):
-        """处理单个任务 - 简化版"""
+        """处理单个任务 - 简化版（不再需要状态检测）"""
         try:
-            # 检查任务是否仍然有效
-            is_valid, reason = self.state_detector.is_task_valid(task)
-
-            if not is_valid:
-                # 任务失效，检查是否需要归档
-                if self.state_detector.should_archive_task(task, reason):
-                    self.task_store.archive_task(task.task_uuid, reason)
-                    self.logger.info(f"任务已归档: {task.torrent_hash}, 原因: {reason}")
-                else:
-                    # 任务暂时无效但不归档，安排重试
-                    self.logger.warning(
-                        f"任务暂时无效，安排重试: {task.torrent_hash}, 原因: {reason}"
-                    )
-                    self._handle_retry(task, f"task_invalid:{reason}")
-                return
-
-            # 任务有效，执行处理
+            # 直接执行任务处理，状态验证已合并到event_handler中
             if task.task_type == "added":
                 result = self.event_handler.process_torrent_addition(
                     task.torrent_hash, task.hash_file_path
@@ -171,10 +153,11 @@ class ResilientTaskManager:
             # 处理结果
             if result == "success":
                 self._handle_success(task)
-            elif result == "retry_later":
-                self._handle_retry(task, "metadata_not_ready")
             else:
-                self._handle_retry(task, "unknown_error")
+                # 任何失败都安排重试
+                self._handle_retry(
+                    task, result if result != "retry_later" else "unknown_error"
+                )
 
         except Exception as e:
             self.logger.error(f"任务处理异常: {task.torrent_hash}, 错误: {e}")

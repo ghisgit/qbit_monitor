@@ -186,23 +186,14 @@ class RetryStrategyFactory:
                 backoff_multiplier=1.2,
                 jitter_factor=0.2,
             ),
-            "file_not_found": RetryStrategyConfig(
-                name="file_not_found",
+            "torrent_not_found": RetryStrategyConfig(
+                name="torrent_not_found",
                 strategy_type=RetryStrategyType.EXPONENTIAL_BACKOFF,
-                base_delay=300,
-                max_delay=3600,
-                max_retries=10,  # 文件问题有限重试
-                backoff_multiplier=3.0,
+                base_delay=5,
+                max_delay=60,
+                max_retries=3,  # 种子不存在
+                backoff_multiplier=1,
                 jitter_factor=0.1,
-            ),
-            "timeout": RetryStrategyConfig(
-                name="timeout",
-                strategy_type=RetryStrategyType.ADAPTIVE,
-                base_delay=120,
-                max_delay=1800,
-                max_retries=None,  # 无限重试
-                backoff_multiplier=2.0,
-                jitter_factor=0.15,
             ),
             "unknown_error": RetryStrategyConfig(
                 name="unknown_error",
