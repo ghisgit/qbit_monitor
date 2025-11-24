@@ -22,7 +22,7 @@ class EventHandler:
         try:
             # 获取种子信息（使用带错误类型的方法）
             torrent, error_type = self.qbt_client.get_torrent_by_hash_with_error(
-                torrent_hash, return_error_type=True
+                torrent_hash
             )
 
             if error_type == "not_found":
