@@ -273,6 +273,8 @@ class EventHandler:
             success = self.disable_files_for_torrent(torrent)
 
             if success:
+                if self.config.disable_after_start:
+                    self.qbt_client.start_torrent(torrent_hash)
                 self.logger.info(f"成功处理新添加种子: {torrent_name}")
                 return "success"
             else:

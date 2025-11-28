@@ -38,6 +38,7 @@ class Config:
             "disable_file_patterns": [],
             "categories": [],
             "debug_mode": False,
+            "disable_after_start": True,
             "disable_before_delete": True,
             "disable_delay": 1,
             "max_workers": 5,
@@ -117,6 +118,10 @@ class Config:
     @property
     def debug_mode(self) -> bool:
         return self._config["debug_mode"]
+
+    @property
+    def disable_after_start(self) -> bool:
+        return self._config["disable_after_start"]
 
     @property
     def disable_before_delete(self) -> bool:

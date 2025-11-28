@@ -9,6 +9,23 @@ class QBittorrentClient:
         self.session = requests.Session()
         self.logger = logging.getLogger(__name__)
 
+    def start_torrent(self, torrent_hash: str) -> bool:
+        """开始下载种子"""
+        try:
+            response = self.session.post(
+                f"{self.base_url}/api/v2/torrents/start",
+                data={"hashes": torrent_hash},
+                timeout=10,
+            )
+            if response.status_code == 200:
+                return True
+            else:
+                self.logger.error(f"启动种子失败: 状态码 {response.status_code}")
+                return False
+        except Exception as e:
+            self.logger.error(f"启动种子失败时发生错误: {e}")
+            return False
+
     def get_torrent_by_hash(
         self, torrent_hash: str, return_error_type: bool = False
     ) -> Optional[Dict]:
