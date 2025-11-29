@@ -174,7 +174,7 @@ class ResilientTaskManager:
                 )
 
                 # 只有真正的系统错误才记录熔断器失败
-                if result in ["qbit_api_error", "network_error", "metadata_not_ready"]:
+                if result in ["qbit_api_error", "network_error"]:
                     self.circuit_breaker.record_failure("qbit_api")
                 else:
                     # 业务逻辑错误不记录熔断器失败
