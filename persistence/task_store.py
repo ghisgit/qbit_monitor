@@ -13,6 +13,8 @@ from config.paths import DATA_DIR, DATA_FILE
 
 @dataclass
 class Task:
+    """任务数据类"""
+
     task_uuid: str
     torrent_hash: str
     task_type: str
@@ -31,6 +33,8 @@ class Task:
 
 @dataclass
 class CircuitBreakerConfig:
+    """熔断器配置"""
+
     failure_threshold: int = 5
     success_threshold: int = 3
     timeout: int = 60
@@ -39,6 +43,8 @@ class CircuitBreakerConfig:
 
 @dataclass
 class RetryStrategy:
+    """重试策略配置"""
+
     base_delay: int
     max_delay: int = None
     backoff_multiplier: float = 2.0
@@ -54,6 +60,7 @@ class ThreadLocalConnection:
         self.local = threading.local()
 
     def get_connection(self) -> sqlite3.Connection:
+        """获取线程本地数据库连接"""
         if not hasattr(self.local, "connection"):
             self.local.connection = sqlite3.connect(
                 self.db_path, timeout=30.0, check_same_thread=False
@@ -65,10 +72,11 @@ class ThreadLocalConnection:
         return self.local.connection
 
     def close_all(self):
+        """关闭所有数据库连接"""
         if hasattr(self.local, "connection"):
             try:
                 self.local.connection.close()
-            except:
+            except Exception:
                 pass
             delattr(self.local, "connection")
 
@@ -113,7 +121,7 @@ class TaskStore:
                 
                 CHECK (status IN ('pending', 'processing', 'completed', 'archived', 'waiting'))
             )
-        """
+            """
         )
 
         # 任务事件表
@@ -127,7 +135,7 @@ class TaskStore:
                 created_time REAL NOT NULL,
                 FOREIGN KEY (task_uuid) REFERENCES tasks(task_uuid)
             )
-        """
+            """
         )
 
         # 熔断状态表
@@ -146,7 +154,7 @@ class TaskStore:
                 created_time REAL NOT NULL,
                 updated_time REAL NOT NULL
             )
-        """
+            """
         )
 
         # 检查点表
@@ -161,7 +169,7 @@ class TaskStore:
                 FOREIGN KEY (task_uuid) REFERENCES tasks(task_uuid),
                 UNIQUE(task_uuid, phase_name)
             )
-        """
+            """
         )
 
         # 创建索引
@@ -170,25 +178,16 @@ class TaskStore:
             CREATE INDEX IF NOT EXISTS idx_tasks_status_retry 
             ON tasks(status, next_retry_time) 
             WHERE status IN ('pending', 'waiting')
-        """
+            """
         )
         cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_tasks_circuit 
-            ON tasks(circuit_state, status)
-        """
+            "CREATE INDEX IF NOT EXISTS idx_tasks_circuit ON tasks(circuit_state, status)"
         )
         cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_tasks_hash_type 
-            ON tasks(torrent_hash, task_type)
-        """
+            "CREATE INDEX IF NOT EXISTS idx_tasks_hash_type ON tasks(torrent_hash, task_type)"
         )
         cursor.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_events_task 
-            ON task_events(task_uuid, created_time)
-        """
+            "CREATE INDEX IF NOT EXISTS idx_events_task ON task_events(task_uuid, created_time)"
         )
 
         conn.commit()
@@ -219,7 +218,7 @@ class TaskStore:
                         created_time, updated_time, last_attempt_time, last_success_time,
                         current_phase
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
+                    """,
                     (
                         task.task_uuid,
                         task.torrent_hash,
@@ -243,7 +242,7 @@ class TaskStore:
                     """
                     INSERT INTO task_events (task_uuid, event_type, event_data, created_time)
                     VALUES (?, ?, ?, ?)
-                """,
+                    """,
                     (
                         task.task_uuid,
                         "created",
@@ -279,7 +278,7 @@ class TaskStore:
                         retry_count ASC,
                         created_time ASC
                     LIMIT ?
-                """,
+                    """,
                     (time.time(), limit),
                 )
 
@@ -297,7 +296,7 @@ class TaskStore:
                         UPDATE tasks 
                         SET status = 'processing', last_attempt_time = ?, updated_time = ?
                         WHERE task_uuid = ?
-                    """,
+                        """,
                         (time.time(), time.time(), task.task_uuid),
                     )
 
@@ -305,7 +304,7 @@ class TaskStore:
                         """
                         INSERT INTO task_events (task_uuid, event_type, event_data, created_time)
                         VALUES (?, ?, ?, ?)
-                    """,
+                        """,
                         (
                             task.task_uuid,
                             "processing_started",
@@ -341,7 +340,7 @@ class TaskStore:
                             last_success_time = ?,
                             updated_time = ?
                         WHERE task_uuid = ?
-                    """,
+                        """,
                         (time.time(), time.time(), task_uuid),
                     )
 
@@ -349,7 +348,7 @@ class TaskStore:
                         """
                         INSERT INTO task_events (task_uuid, event_type, event_data, created_time)
                         VALUES (?, ?, ?, ?)
-                    """,
+                        """,
                         (task_uuid, "completed", "{}", time.time()),
                     )
 
@@ -363,7 +362,7 @@ class TaskStore:
                             next_retry_time = ?,
                             updated_time = ?
                         WHERE task_uuid = ?
-                    """,
+                        """,
                         (failure_reason, next_retry_time, time.time(), task_uuid),
                     )
 
@@ -371,7 +370,7 @@ class TaskStore:
                         """
                         INSERT INTO task_events (task_uuid, event_type, event_data, created_time)
                         VALUES (?, ?, ?, ?)
-                    """,
+                        """,
                         (
                             task_uuid,
                             "retry_scheduled",
@@ -406,7 +405,7 @@ class TaskStore:
                     UPDATE tasks 
                     SET status = 'archived', updated_time = ?
                     WHERE task_uuid = ?
-                """,
+                    """,
                     (time.time(), task_uuid),
                 )
 
@@ -414,7 +413,7 @@ class TaskStore:
                     """
                     INSERT INTO task_events (task_uuid, event_type, event_data, created_time)
                     VALUES (?, ?, ?, ?)
-                """,
+                    """,
                     (
                         task_uuid,
                         "archived",
@@ -439,7 +438,7 @@ class TaskStore:
                     SELECT 1 FROM tasks 
                     WHERE torrent_hash = ? AND task_type = ?
                     AND status != 'completed' AND status != 'archived'
-                """,
+                    """,
                     (torrent_hash, task_type),
                 )
 
@@ -463,7 +462,7 @@ class TaskStore:
                         WHERE task_type = ? 
                         AND status IN ('pending', 'waiting')
                         ORDER BY created_time
-                    """,
+                        """,
                         (task_type,),
                     )
                 else:
@@ -473,7 +472,7 @@ class TaskStore:
                         FROM tasks 
                         WHERE status IN ('pending', 'waiting')
                         ORDER BY created_time
-                    """
+                        """
                     )
 
                 return cursor.fetchall()
@@ -491,7 +490,7 @@ class TaskStore:
                     """
                     DELETE FROM tasks 
                     WHERE torrent_hash = ? AND task_type = ?
-                """,
+                    """,
                     (torrent_hash, task_type),
                 )
 

@@ -1,3 +1,4 @@
+import os
 import threading
 import time
 import logging
@@ -33,6 +34,10 @@ class ResilientTaskManager:
         self.batch_size = getattr(config, "batch_size", 5)
         self.poll_interval = getattr(config, "poll_interval", 10)
         self.max_workers = getattr(config, "max_workers", 3)
+
+        # 熔断器状态跟踪
+        self.last_breaker_check = time.time()
+        self.consecutive_breaker_failures = 0
 
     def submit_task(
         self, task_type: str, torrent_hash: str, hash_file_path: str
@@ -85,9 +90,8 @@ class ResilientTaskManager:
         self.logger.info(f"启动了 {self.max_workers} 个数据库轮询工作线程")
 
     def _database_polling_worker(self):
-        """数据库轮询工作线程"""
+        """数据库轮询工作线程 - 修复熔断器逻辑"""
         thread_name = threading.current_thread().name
-
         self.logger.debug(f"{thread_name} 开始运行")
 
         while self.running:
@@ -98,9 +102,13 @@ class ResilientTaskManager:
                     time.sleep(30)
                     continue
 
-                # 检查熔断器状态
+                # 检查熔断器状态 - 真正阻止执行
                 if not self.circuit_breaker.can_execute("qbit_api"):
-                    self.logger.debug(f"{thread_name} 因熔断器开启暂停处理")
+                    breaker_status = self.circuit_breaker.get_breaker_status("qbit_api")
+                    self.logger.warning(
+                        f"{thread_name} 因熔断器开启暂停处理。状态: {breaker_status['state']}, "
+                        f"失败次数: {breaker_status['failure_count']}"
+                    )
                     time.sleep(10)
                     continue
 
@@ -138,9 +146,14 @@ class ResilientTaskManager:
         self.logger.debug(f"{thread_name} 停止运行")
 
     def _process_single_task(self, task: Task):
-        """处理单个任务 - 简化版（不再需要状态检测）"""
+        """处理单个任务 - 增强熔断器记录"""
         try:
-            # 直接执行任务处理，状态验证已合并到event_handler中
+            # 再次检查熔断器状态（防止状态在获取任务后变化）
+            if not self.circuit_breaker.can_execute("qbit_api"):
+                self.logger.warning(f"任务 {task.torrent_hash} 因熔断器开启被跳过")
+                return
+
+            # 直接执行任务处理
             if task.task_type == "added":
                 result = self.event_handler.process_torrent_addition(
                     task.torrent_hash, task.hash_file_path
@@ -150,19 +163,27 @@ class ResilientTaskManager:
                     task.torrent_hash, task.hash_file_path
                 )
 
-            # 处理结果
+            # 处理结果 - 正确记录熔断器状态
             if result == "success":
                 self._handle_success(task)
+                self.circuit_breaker.record_success("qbit_api")  # 明确记录成功
             else:
-                # 任何失败都安排重试
+                # 任何失败都安排重试并记录熔断器失败
                 self._handle_retry(
                     task, result if result != "retry_later" else "unknown_error"
                 )
 
+                # 只有真正的系统错误才记录熔断器失败
+                if result in ["qbit_api_error", "network_error", "metadata_not_ready"]:
+                    self.circuit_breaker.record_failure("qbit_api")
+                else:
+                    # 业务逻辑错误不记录熔断器失败
+                    self.logger.debug(f"业务逻辑错误，不记录熔断器失败: {result}")
+
         except Exception as e:
             self.logger.error(f"任务处理异常: {task.torrent_hash}, 错误: {e}")
             self._handle_retry(task, f"processing_exception:{str(e)}")
-            self.circuit_breaker.record_failure("qbit_api")
+            self.circuit_breaker.record_failure("qbit_api")  # 异常时记录失败
 
     def _handle_success(self, task: Task):
         """处理成功结果"""
@@ -173,7 +194,7 @@ class ResilientTaskManager:
 
             if success:
                 self.logger.info(f"任务处理成功: {task.torrent_hash}")
-                self.circuit_breaker.record_success("qbit_api")
+                # 注意：熔断器成功记录已经在 _process_single_task 中处理
             else:
                 self.logger.error(f"更新任务状态失败: {task.torrent_hash}")
 
@@ -216,8 +237,6 @@ class ResilientTaskManager:
 
     def _cleanup_hash_file(self, hash_file_path: str):
         """清理哈希文件"""
-        import os
-
         try:
             if os.path.exists(hash_file_path):
                 os.remove(hash_file_path)
@@ -237,14 +256,13 @@ class ResilientTaskManager:
         self.logger.info("所有工作线程已停止")
 
     def get_system_status(self) -> dict:
-        """获取系统状态"""
+        """获取系统状态 - 包含熔断器信息"""
         health_status = self.health_checker.get_system_load_status()
+        breaker_status = self.circuit_breaker.get_breaker_status("qbit_api")
 
         return {
             "health_status": health_status,
+            "circuit_breaker": breaker_status,
             "active_workers": len([w for w in self.workers if w.is_alive()]),
             "running": self.running,
-            "circuit_breakers": {
-                "qbit_api": self.circuit_breaker.can_execute("qbit_api")
-            },
         }

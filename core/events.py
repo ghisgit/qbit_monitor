@@ -7,6 +7,8 @@ from persistence.task_store import Task
 
 
 class EventHandler:
+    """事件处理器 - 处理种子添加和完成事件"""
+
     def __init__(self, qbt_client, file_ops, config):
         self.qbt_client = qbt_client
         self.file_ops = file_ops
@@ -17,38 +19,35 @@ class EventHandler:
         self, torrent_hash: str, task_type: str
     ) -> Tuple[Optional[dict], str]:
         """
-        根据验证返回不同错误类型
+        获取并验证种子信息
+
+        Returns:
+            Tuple[Optional[dict], str]:
+                - (torrent, "continue"): 种子有效，继续处理
+                - (None, "success"): 种子不符合处理条件，任务完成
+                - (None, error_type): 需要重试的错误类型
         """
         try:
-            # 获取种子信息（使用带错误类型的方法）
+            # 获取种子信息
             torrent, error_type = self.qbt_client.get_torrent_by_hash_with_error(
                 torrent_hash
             )
 
             if error_type == "not_found":
-                # 种子确实不存在，需要重试（可能正在添加中）
-                self.logger.warning(f"种子不存在: {torrent_hash}，移除任务")
+                self.logger.warning(f"种子不存在: {torrent_hash}")
                 return None, "torrent_not_found"
             elif error_type == "api_error":
-                # qBittorrent服务问题，需要重试
-                self.logger.warning(
-                    f"qBittorrent服务暂时不可用: {torrent_hash}, 错误类型: {error_type}"
-                )
+                self.logger.warning(f"qBittorrent服务暂时不可用: {torrent_hash}")
                 return None, "qbit_api_error"
             elif error_type == "network_error":
-                # 网络问题，需要重试
-                self.logger.warning(
-                    f"网络暂时不可用: {torrent_hash}, 错误类型: {error_type}"
-                )
+                self.logger.warning(f"网络暂时不可用: {torrent_hash}")
                 return None, "network_error"
             elif torrent is None:
-                # 其他未知错误，需要重试
                 self.logger.warning(f"获取种子信息失败但原因未知: {torrent_hash}")
                 return None, "retry_later"
 
             # 成功获取到种子信息，检查是否应该处理
             torrent_name = torrent.get("name", "Unknown")
-
             self.logger.debug(
                 f"种子验证通过: {torrent_name}, "
                 f"任务类型: {task_type}, 大小: {self._format_size(torrent.get('size', 0))}"
@@ -63,7 +62,6 @@ class EventHandler:
 
         except Exception as e:
             self.logger.warning(f"种子验证过程异常: {torrent_hash}, 错误: {e}")
-            # 验证过程中出现异常，需要重试
             return None, "retry_later"
 
     def _check_metadata_ready(self, torrent_hash: str, torrent_name: str) -> bool:
@@ -90,7 +88,7 @@ class EventHandler:
         return torrent_category in self.config.categories
 
     def get_files_to_disable(self, torrent: dict) -> List[int]:
-        """获取需要禁用的文件索引列表（使用 disable_file_patterns）"""
+        """获取需要禁用的文件索引列表"""
         files_to_disable = []
         torrent_hash = torrent["hash"]
         torrent_name = torrent.get("name", "Unknown")
@@ -107,7 +105,7 @@ class EventHandler:
                 file_priority = file_info.get("priority", 1)
                 file_index = file_info["index"]
 
-                # 检查是否应该禁用文件下载（使用 disable_file_patterns）
+                # 检查是否应该禁用文件下载
                 if self.file_ops.should_disable_file(file_name) and file_priority != 0:
                     files_to_disable.append(file_index)
                     self.logger.info(f"标记文件为不下载: {file_name}")
@@ -122,7 +120,7 @@ class EventHandler:
         return files_to_disable
 
     def disable_files_for_torrent(self, torrent: dict) -> bool:
-        """为种子禁用匹配的文件下载，返回是否成功"""
+        """为种子禁用匹配的文件下载"""
         torrent_hash = torrent["hash"]
         torrent_name = torrent.get("name", "Unknown")
 
@@ -155,7 +153,7 @@ class EventHandler:
             return False
 
     def clean_torrent_files(self, torrent: dict) -> int:
-        """清理单个种子的无用文件和文件夹（基于文件系统，不依赖种子信息）"""
+        """清理单个种子的无用文件和文件夹"""
         deleted_count = 0
         torrent_name = torrent.get("name", "Unknown")
 
@@ -184,7 +182,7 @@ class EventHandler:
                 if self.config.disable_delay > 0:
                     time.sleep(self.config.disable_delay)
 
-            # 清理文件和文件夹（基于文件系统扫描）
+            # 清理文件和文件夹
             deleted_count = self.clean_directory(content_dir)
 
             self.logger.info(
@@ -197,7 +195,7 @@ class EventHandler:
         return deleted_count
 
     def clean_directory(self, directory: str) -> int:
-        """清理目录中匹配的文件和文件夹（基于文件系统）"""
+        """清理目录中匹配的文件和文件夹"""
         deleted_count = 0
 
         if not os.path.exists(directory):
@@ -210,7 +208,7 @@ class EventHandler:
                 item_path = os.path.join(directory, item)
 
                 if os.path.isfile(item_path):
-                    # 处理文件（使用 file_patterns）
+                    # 处理文件
                     if self.file_ops.should_delete_file_by_name(item):
                         try:
                             os.remove(item_path)
@@ -220,7 +218,7 @@ class EventHandler:
                             self.logger.error(f"删除文件失败 {item_path}: {e}")
 
                 elif os.path.isdir(item_path):
-                    # 处理文件夹（使用 folder_patterns）
+                    # 处理文件夹
                     if self.file_ops.should_delete_folder(item):
                         try:
                             shutil.rmtree(item_path)
@@ -232,7 +230,7 @@ class EventHandler:
                         # 递归清理子目录
                         deleted_count += self.clean_directory(item_path)
 
-            # 清理空目录（使用 FileOperations 的方法）
+            # 清理空目录
             self.file_ops.clean_empty_directories(directory, directory)
 
         except Exception as e:
@@ -254,50 +252,59 @@ class EventHandler:
         return f"{size_bytes:.2f} {size_names[i]}"
 
     def process_torrent_addition(self, torrent_hash: str, hash_file_path: str) -> str:
-        """处理新添加的种子，返回状态码"""
+        """处理新添加的种子 - 改进错误分类"""
         self.logger.info(f"处理新添加的种子: {torrent_hash}")
 
         try:
-            # 统一验证逻辑（包含detector功能）
+            # 统一验证逻辑
             torrent, status = self._get_and_validate_torrent(torrent_hash, "added")
             if status != "continue":
                 return status
 
             torrent_name = torrent.get("name", "Unknown")
 
-            # 检查元数据是否就绪（添加任务特有逻辑）
+            # 检查元数据是否就绪
             if not self._check_metadata_ready(torrent_hash, torrent_name):
-                return "metadata_not_ready"
+                return "metadata_not_ready"  # 这会触发熔断器
 
-            # 禁用匹配的文件（添加任务特有逻辑）
+            # 禁用匹配的文件
             success = self.disable_files_for_torrent(torrent)
 
             if success:
                 if self.config.disable_after_start:
-                    self.qbt_client.start_torrent(torrent_hash)
+                    start_success = self.qbt_client.start_torrent(torrent_hash)
+                    if not start_success:
+                        self.logger.warning(f"启动种子失败: {torrent_name}")
+                        return "qbit_api_error"  # 这会触发熔断器
+
                 self.logger.info(f"成功处理新添加种子: {torrent_name}")
                 return "success"
             else:
                 self.logger.warning(f"种子 {torrent_name} 文件禁用失败，需要重试")
-                return "retry_later"
+                return "qbit_api_error"  # 这会触发熔断器
 
         except Exception as e:
-            self.logger.error(f"处理新添加种子 {torrent_hash} 时发生错误: {e}")
-            return "retry_later"
+            error_msg = str(e).lower()
+            if "connection" in error_msg or "timeout" in error_msg:
+                self.logger.error(f"网络错误处理新添加种子 {torrent_hash}: {e}")
+                return "network_error"  # 这会触发熔断器
+            else:
+                self.logger.error(f"处理新添加种子 {torrent_hash} 时发生错误: {e}")
+                return "retry_later"  # 业务错误，不触发熔断器
 
     def process_torrent_completion(self, torrent_hash: str, hash_file_path: str) -> str:
-        """处理已完成的种子，返回状态码"""
+        """处理已完成的种子"""
         self.logger.info(f"处理已完成的种子: {torrent_hash}")
 
         try:
-            # 统一验证逻辑（包含detector功能）
+            # 统一验证逻辑
             torrent, status = self._get_and_validate_torrent(torrent_hash, "completed")
             if status != "continue":
                 return status
 
             torrent_name = torrent.get("name", "Unknown")
 
-            # 清理文件（完成任务特有逻辑）
+            # 清理文件
             deleted_count = self.clean_torrent_files(torrent)
             self.logger.info(
                 f"成功处理已完成种子: {torrent_name}, 删除了 {deleted_count} 个文件/文件夹"

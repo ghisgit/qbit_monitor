@@ -125,7 +125,7 @@ class AdaptiveStrategy(RetryStrategy):
             "metadata_not_ready": 30,
             "qbit_api_error": 60,
             "network_error": 10,
-            "file_not_found": 300,
+            "torrent_not_found": 5,
             "timeout": 120,
         }
 
@@ -191,7 +191,7 @@ class RetryStrategyFactory:
                 strategy_type=RetryStrategyType.EXPONENTIAL_BACKOFF,
                 base_delay=5,
                 max_delay=60,
-                max_retries=3,  # 种子不存在
+                max_retries=3,  # 种子不存在有限重试
                 backoff_multiplier=1,
                 jitter_factor=0.1,
             ),

@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 
+
 # 基础目录
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -11,7 +12,6 @@ COMPLETED_TORRENTS_DIR = BASE_DIR / "scripts/completed_torrents"
 # 日志目录和文件
 LOG_DIR = BASE_DIR / "logs"
 LOG_FILE = LOG_DIR / "qbit_monitor.log"
-
 
 # 数据目录
 DATA_DIR = BASE_DIR / "data"

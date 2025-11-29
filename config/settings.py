@@ -1,10 +1,11 @@
 import json
-import os
 from pathlib import Path
 from typing import Dict, List
 
 
 class Config:
+    """配置管理器"""
+
     def __init__(self, config_file: str = "config.json"):
         self.config_file = Path(config_file)
         self.config_mtime = 0
@@ -44,34 +45,35 @@ class Config:
             "max_workers": 5,
             "batch_size": 10,
             "poll_interval": 10,
+            "min_stalled_minutes": 30,
+            "stalled_check_interval": 300,
+            "progress_threshold": 0.95,
         }
 
     def load_config(self) -> bool:
-        """加载配置文件，只在有修改时记录日志"""
+        """加载配置文件"""
         try:
             if not self.config_file.exists():
                 return False
 
             current_mtime = self.config_file.stat().st_mtime
             if current_mtime == self.config_mtime:
-                return True  # 配置未修改，不记录日志
+                return True
 
             self.config_mtime = current_mtime
 
             with open(self.config_file, "r", encoding="utf-8") as f:
                 user_config = json.load(f)
 
-            # 记录配置修改
             if self._logger:
                 self._log_info("检测到配置文件修改，重新加载")
 
-                # 在debug模式下打印修改项
                 if hasattr(self, "debug_mode") and self.debug_mode:
-                    changed_keys = []
-                    for key, value in user_config.items():
-                        if key in self._config and self._config[key] != value:
-                            changed_keys.append(key)
-
+                    changed_keys = [
+                        key
+                        for key, value in user_config.items()
+                        if key in self._config and self._config[key] != value
+                    ]
                     if changed_keys:
                         self._log_debug(f"修改的配置项: {changed_keys}")
 
@@ -83,6 +85,7 @@ class Config:
                 self._log_info(f"加载配置文件失败: {e}")
             return False
 
+    # 配置属性访问器
     @property
     def host(self) -> str:
         return self._config["host"]
@@ -142,3 +145,15 @@ class Config:
     @property
     def poll_interval(self) -> int:
         return self._config["poll_interval"]
+
+    @property
+    def min_stalled_minutes(self) -> int:
+        return self._config["min_stalled_minutes"]
+
+    @property
+    def stalled_check_interval(self) -> int:
+        return self._config["stalled_check_interval"]
+
+    @property
+    def progress_threshold(self) -> float:
+        return self._config["progress_threshold"]

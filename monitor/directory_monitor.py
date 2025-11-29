@@ -1,7 +1,7 @@
 import os
+import logging
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-import logging
 
 
 class TorrentFileHandler(FileSystemEventHandler):

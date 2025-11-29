@@ -1,9 +1,12 @@
-import requests
+import time
 import logging
 from typing import List, Dict, Optional, Tuple
+import requests
 
 
 class QBittorrentClient:
+    """qBittorrent API客户端"""
+
     def __init__(self, host: str, port: int):
         self.base_url = f"http://{host}:{port}"
         self.session = requests.Session()
@@ -34,7 +37,7 @@ class QBittorrentClient:
 
         Args:
             torrent_hash: 种子哈希
-            return_error_type: 是否返回错误类型（向后兼容）
+            return_error_type: 是否返回错误类型
 
         Returns:
             如果 return_error_type=False: 直接返回torrent字典或None
@@ -93,7 +96,7 @@ class QBittorrentClient:
     def get_torrent_by_hash_with_error(
         self, torrent_hash: str
     ) -> Tuple[Optional[Dict], Optional[str]]:
-        """获取种子信息并返回错误类型（供state_detector使用）"""
+        """获取种子信息并返回错误类型"""
         return self.get_torrent_by_hash(torrent_hash, return_error_type=True)
 
     def get_torrent_files(self, torrent_hash: str) -> List[Dict]:
@@ -126,8 +129,8 @@ class QBittorrentClient:
             response = self.session.post(
                 f"{self.base_url}/api/v2/torrents/filePrio", data=data, timeout=10
             )
-
             return response.status_code == 200
+
         except Exception as e:
             self.logger.error(f"设置文件优先级时发生错误: {e}")
             return False
@@ -143,10 +146,9 @@ class QBittorrentClient:
                 if response.status_code == 200:
                     self.logger.info(f"qBittorrent已启动! 版本: {response.text}")
                     break
+                time.sleep(5)
             except Exception as e:
                 self.logger.debug(f"qBittorrent尚未启动，等待... {e}")
-                import time
-
                 time.sleep(5)
 
     def get_app_version(self) -> str:
@@ -171,6 +173,7 @@ class QBittorrentClient:
                 return True, "connected"
             else:
                 return False, f"api_error_{response.status_code}"
+
         except requests.exceptions.Timeout:
             return False, "timeout"
         except requests.exceptions.ConnectionError:

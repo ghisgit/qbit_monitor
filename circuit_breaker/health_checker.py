@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 @dataclass
 class HealthStatus:
+    """健康状态"""
+
     status: str  # 'healthy', 'degraded', 'unhealthy'
     response_time: float
     last_check: float

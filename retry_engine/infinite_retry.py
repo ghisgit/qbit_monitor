@@ -6,7 +6,7 @@ from .strategies import StrategyManager, RetryStrategy
 
 
 class InfiniteRetryEngine:
-    """无限重试引擎 - 使用新的策略系统"""
+    """无限重试引擎 - 使用策略系统"""
 
     def __init__(self):
         self.logger = logging.getLogger(__name__)

@@ -1,65 +1,48 @@
 import os
 import re
 import shutil
+import logging
 from pathlib import Path
 from typing import List
-import logging
 
 
 class FileOperations:
+    """文件操作管理器"""
+
     def __init__(self, config):
         self.config = config
         self.logger = logging.getLogger(__name__)
 
     def should_delete_file(self, filename: str, file_size: int) -> bool:
-        """判断是否应该删除文件（使用 file_patterns，包含文件大小检查）"""
+        """判断是否应该删除文件（包含文件大小检查）"""
         # 检查文件大小
         min_size_bytes = self.config.min_file_size_mb * 1024 * 1024
         if file_size < min_size_bytes:
             return True
 
-        # 检查正则表达式匹配（使用 file_patterns）
-        for pattern in self.config.file_patterns:
-            try:
-                if re.match(pattern, filename, re.IGNORECASE):
-                    return True
-            except re.error as e:
-                self.logger.error(f"文件正则表达式错误: {pattern}, 错误: {e}")
-
-        return False
+        # 检查正则表达式匹配
+        return self._match_patterns(filename, self.config.file_patterns)
 
     def should_delete_file_by_name(self, filename: str) -> bool:
-        """判断是否应该删除文件（仅基于文件名，使用 file_patterns）"""
-        # 检查正则表达式匹配（使用 file_patterns）
-        for pattern in self.config.file_patterns:
-            try:
-                if re.match(pattern, filename, re.IGNORECASE):
-                    return True
-            except re.error as e:
-                self.logger.error(f"文件正则表达式错误: {pattern}, 错误: {e}")
-
-        return False
+        """判断是否应该删除文件（仅基于文件名）"""
+        return self._match_patterns(filename, self.config.file_patterns)
 
     def should_disable_file(self, filename: str) -> bool:
-        """判断是否应该禁用文件下载（使用 disable_file_patterns）"""
-        for pattern in self.config.disable_file_patterns:
-            try:
-                if re.match(pattern, filename, re.IGNORECASE):
-                    return True
-            except re.error as e:
-                self.logger.error(f"禁用正则表达式错误: {pattern}, 错误: {e}")
-
-        return False
+        """判断是否应该禁用文件下载"""
+        return self._match_patterns(filename, self.config.disable_file_patterns)
 
     def should_delete_folder(self, folder_name: str) -> bool:
-        """判断是否应该删除文件夹（使用 folder_patterns）"""
-        for pattern in self.config.folder_patterns:
+        """判断是否应该删除文件夹"""
+        return self._match_patterns(folder_name, self.config.folder_patterns)
+
+    def _match_patterns(self, name: str, patterns: List[str]) -> bool:
+        """匹配正则表达式模式"""
+        for pattern in patterns:
             try:
-                if re.match(pattern, folder_name, re.IGNORECASE):
+                if re.match(pattern, name, re.IGNORECASE):
                     return True
             except re.error as e:
-                self.logger.error(f"文件夹正则表达式错误: {pattern}, 错误: {e}")
-
+                self.logger.error(f"正则表达式错误: {pattern}, 错误: {e}")
         return False
 
     def get_torrent_content_directory(self, torrent: dict) -> str:
@@ -81,7 +64,6 @@ class FileOperations:
         try:
             norm_path = os.path.normpath(path)
             norm_content_dir = os.path.normpath(content_dir)
-
             return norm_path.startswith(norm_content_dir)
         except Exception as e:
             self.logger.error(f"检查路径是否在内容目录内时发生错误: {e}")
@@ -100,7 +82,6 @@ class FileOperations:
                 and self.is_path_in_content_directory(str(current_dir), content_dir)
                 and current_dir != content_dir_path
             ):
-
                 # 检查目录是否为空
                 if not any(current_dir.iterdir()):
                     try:
@@ -111,6 +92,7 @@ class FileOperations:
                         break
                 else:
                     break
+
         except Exception as e:
             self.logger.error(f"清理空目录时发生错误: {e}")
 

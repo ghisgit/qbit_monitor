@@ -8,6 +8,8 @@ from persistence.task_store import CircuitBreakerConfig, TaskStore
 
 @dataclass
 class BreakerState:
+    """熔断器状态"""
+
     state: str  # 'closed', 'open', 'half_open'
     failure_count: int
     success_count: int
@@ -17,7 +19,7 @@ class BreakerState:
 
 
 class CircuitBreaker:
-    """熔断器实现"""
+    """熔断器实现 - 防止级联故障"""
 
     def __init__(self, task_store: TaskStore):
         self.task_store = task_store
@@ -26,22 +28,16 @@ class CircuitBreaker:
         # 预定义熔断器配置
         self.breaker_configs = {
             "qbit_api": CircuitBreakerConfig(
-                failure_threshold=5,
-                success_threshold=3,
+                failure_threshold=3,  # 降低阈值以便更快触发
+                success_threshold=2,
                 timeout=60,
                 half_open_timeout=30,
             ),
             "file_operations": CircuitBreakerConfig(
-                failure_threshold=10,
-                success_threshold=5,
+                failure_threshold=5,
+                success_threshold=3,
                 timeout=30,
                 half_open_timeout=15,
-            ),
-            "network": CircuitBreakerConfig(
-                failure_threshold=8,
-                success_threshold=4,
-                timeout=45,
-                half_open_timeout=20,
             ),
         }
 
@@ -67,23 +63,32 @@ class CircuitBreaker:
                 )
 
     def can_execute(self, breaker_type: str) -> bool:
-        """检查是否允许执行操作"""
+        """检查是否允许执行操作 - 核心熔断逻辑"""
         state = self._load_breaker_state(breaker_type)
         config = self.breaker_configs[breaker_type]
 
         if not state:
             return True
 
+        current_time = time.time()
+
         if state.state == "open":
             # 检查是否应该进入半开状态
-            if time.time() - state.last_state_change > config.timeout:
+            if current_time - state.last_state_change > config.timeout:
                 self._set_breaker_state(breaker_type, "half_open")
+                self.logger.warning(f"熔断器 {breaker_type} 进入半开状态")
                 return True
+            self.logger.debug(f"熔断器 {breaker_type} 处于开启状态，拒绝请求")
             return False
 
         elif state.state == "half_open":
             # 半开状态：允许少量请求通过进行测试
-            return self._allow_half_open_request(breaker_type, state, config)
+            if self._allow_half_open_request(breaker_type, state, config):
+                self.logger.debug(f"熔断器 {breaker_type} 半开状态允许测试请求")
+                return True
+            else:
+                self.logger.debug(f"熔断器 {breaker_type} 半开状态限制请求")
+                return False
 
         return True  # closed状态
 
@@ -95,11 +100,14 @@ class CircuitBreaker:
         if not state:
             return
 
+        self.logger.debug(f"熔断器 {breaker_type} 记录成功")
+
         if state.state == "half_open":
             new_success_count = state.success_count + 1
             if new_success_count >= config.success_threshold:
                 # 成功次数达到阈值，关闭熔断器
                 self._set_breaker_state(breaker_type, "closed")
+                self.logger.info(f"熔断器 {breaker_type} 成功恢复，转为关闭状态")
             else:
                 # 更新成功计数
                 self._update_breaker_state(
@@ -110,7 +118,7 @@ class CircuitBreaker:
                     },
                 )
         else:
-            # 重置失败计数
+            # 在关闭状态下，重置失败计数
             self._update_breaker_state(
                 breaker_type, {"failure_count": 0, "last_success_time": time.time()}
             )
@@ -131,13 +139,18 @@ class CircuitBreaker:
             )
 
         new_failure_count = state.failure_count + 1
+        self.logger.warning(
+            f"熔断器 {breaker_type} 记录失败，失败次数: {new_failure_count}"
+        )
 
         if state.state == "half_open":
             # 半开状态下失败，立即重新打开熔断器
             self._set_breaker_state(breaker_type, "open")
+            self.logger.error(f"熔断器 {breaker_type} 半开状态下失败，重新开启")
         elif new_failure_count >= config.failure_threshold:
             # 达到失败阈值，打开熔断器
             self._set_breaker_state(breaker_type, "open")
+            self.logger.error(f"熔断器 {breaker_type} 达到失败阈值，开启熔断")
         else:
             # 更新失败计数
             self._update_breaker_state(
@@ -149,11 +162,32 @@ class CircuitBreaker:
         self, breaker_type: str, state: BreakerState, config: CircuitBreakerConfig
     ) -> bool:
         """半开状态下是否允许请求"""
-        # 简单的策略：每half_open_timeout秒允许一个请求
         current_time = time.time()
+
+        # 策略1：每half_open_timeout秒允许一个请求
         if current_time - state.last_state_change > config.half_open_timeout:
             return True
-        return state.success_count < 1  # 半开状态下至少允许一个请求
+
+        # 策略2：限制半开状态下的并发请求数
+        max_half_open_requests = 1
+        return state.success_count < max_half_open_requests
+
+    def get_breaker_status(self, breaker_type: str) -> Dict:
+        """获取熔断器状态信息"""
+        state = self._load_breaker_state(breaker_type)
+        if not state:
+            return {"state": "unknown", "error": "state_not_found"}
+
+        config = self.breaker_configs.get(breaker_type, {})
+        return {
+            "state": state.state,
+            "failure_count": state.failure_count,
+            "success_count": state.success_count,
+            "last_state_change": state.last_state_change,
+            "last_failure_time": state.last_failure_time,
+            "last_success_time": state.last_success_time,
+            "config": config.__dict__ if config else {},
+        }
 
     def _load_breaker_state(self, breaker_type: str) -> Optional[BreakerState]:
         """从数据库加载熔断器状态"""
@@ -194,7 +228,7 @@ class CircuitBreaker:
                     (breaker_type, state, failure_count, success_count, last_state_change,
                      last_failure_time, last_success_time, config, created_time, updated_time)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
+                    """,
                     (
                         breaker_type,
                         state.state,
@@ -216,8 +250,10 @@ class CircuitBreaker:
         """设置熔断器状态"""
         state = self._load_breaker_state(breaker_type)
         if state:
+            old_state = state.state
             state.state = new_state
             state.last_state_change = time.time()
+
             if new_state == "closed":
                 state.failure_count = 0
                 state.success_count = 0
@@ -225,8 +261,9 @@ class CircuitBreaker:
                 state.success_count = 0  # 重置成功计数
 
             self._save_breaker_state(breaker_type, state)
-
-            self.logger.info(f"熔断器 {breaker_type} 状态变更为: {new_state}")
+            self.logger.info(
+                f"熔断器 {breaker_type} 状态从 {old_state} 变更为: {new_state}"
+            )
 
     def _update_breaker_state(self, breaker_type: str, updates: Dict):
         """更新熔断器状态"""
