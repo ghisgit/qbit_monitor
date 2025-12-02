@@ -55,14 +55,15 @@ class StalledSeedMonitor:
     def _get_stalled_torrents(self) -> List:
         """获取停滞状态的种子"""
         try:
-            stalled_torrents = self.qbt_client.torrents_info(
+            stalled_torrents = self.qbt_client.client.torrents_info(
                 status_filter="downloading"
             )
 
             active_stalled = [
                 torrent
                 for torrent in stalled_torrents
-                if torrent.progress < 0.95 and torrent.state == "stalledDL"
+                if torrent.progress < self.progress_threshold
+                and torrent.state == "stalledDL"
             ]
 
             self.logger.debug(f"发现 {len(active_stalled)} 个活跃的停滞种子")
