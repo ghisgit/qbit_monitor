@@ -30,6 +30,6 @@ USER developer
 
 # 安装 Python 包到用户目录
 ENV PATH="/home/developer/.local/bin:${PATH}"
-RUN RUN pip install -U pip && pip install requests watchdog qbittorrent-api
+RUN pip install -U pip && pip install requests watchdog qbittorrent-api
 
 CMD ["./wait-for-qbit.sh", "python", "main.py"]
