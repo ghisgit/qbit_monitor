@@ -30,4 +30,4 @@ USER developer
 
 # 安装 Python 包到用户目录
 ENV PATH="/home/developer/.local/bin:${PATH}"
-RUN pip install requests watchdog black
+RUN pip install requests watchdog qbittorrent-api black
