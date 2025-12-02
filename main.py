@@ -5,32 +5,23 @@ import time
 import logging
 
 from config.settings import Config
-from config.paths import (
-    ADDED_TORRENTS_DIR,
-    COMPLETED_TORRENTS_DIR,
-    LOG_FILE,
-    DATA_FILE,
-    ensure_directories,
-)
-from monitor.stalled_seed_monitor import StalledSeedMonitor
 from utils.logging import setup_logging
 from core.qbittorrent import QBittorrentClient
 from core.file_operations import FileOperations
 from core.events import EventHandler
-from monitor.directory_monitor import DirectoryMonitor
-from monitor.task_manager import ResilientTaskManager
-from persistence.task_store import TaskStore
+from monitor.task_manager import TaskManager
+from monitor.stalled_seed_monitor import StalledSeedMonitor
 
 
 class QBitMonitor:
-    """增强的qBittorrent监控器 - 永不丢失架构"""
+    """qBittorrent监控器 - 基于标签架构"""
 
     def __init__(self):
-        ensure_directories()
         self.config = Config()
-        setup_logging(LOG_FILE, self.config.debug_mode)
+        setup_logging(debug_mode=self.config.debug_mode)
         self.logger = logging.getLogger(__name__)
         self.running = False
+        self.already_stopped = False
         self._init_components()
 
     def _init_components(self):
@@ -39,17 +30,19 @@ class QBitMonitor:
         self.config.load_config()
 
         # 核心组件
-        self.task_store = TaskStore(DATA_FILE)
-        self.qbt_client = QBittorrentClient(self.config.host, self.config.port)
+        self.qbt_client = QBittorrentClient(
+            host=self.config.host,
+            port=self.config.port,
+            username=self.config.username,
+            password=self.config.password,
+        )
         self.file_ops = FileOperations(self.config)
         self.event_handler = EventHandler(self.qbt_client, self.file_ops, self.config)
 
-        # 弹性任务管理器
-        self.task_manager = ResilientTaskManager(
+        # 任务管理器
+        self.task_manager = TaskManager(
             event_handler=self.event_handler,
-            task_store=self.task_store,
             qbt_client=self.qbt_client,
-            file_ops=self.file_ops,
             config=self.config,
         )
 
@@ -57,25 +50,25 @@ class QBitMonitor:
         self.stalled_monitor = StalledSeedMonitor(self.qbt_client, self.config)
         self.stalled_monitor_thread = None
 
-        # 目录监控器
-        self.directory_monitor = DirectoryMonitor(
-            event_handler=self.event_handler,
-            added_dir=ADDED_TORRENTS_DIR,
-            completed_dir=COMPLETED_TORRENTS_DIR,
-            task_manager=self.task_manager,
-            task_store=self.task_store,
-        )
-
     def start(self):
         """启动监控器"""
         self.running = True
+        self.already_stopped = False  # 重置停止标志
         self._setup_signal_handlers()
+
+        # 等待qBittorrent启动并连接
         self.qbt_client.wait_for_qbit()
 
-        self.logger.info("qBittorrent监控器启动 - 永不丢失架构")
+        self.logger.info("qBittorrent监控器启动 - 简化标签架构")
         self.logger.info(f"最大工作线程数: {self.task_manager.max_workers}")
+        self.logger.info(
+            f"添加标签: {self.config.added_tag}, 完成标签: {self.config.completed_tag}"
+        )
 
+        # 启动所有组件
         self._start_safely()
+
+        # 主循环
         self._run_main_loop()
 
     def _setup_signal_handlers(self):
@@ -85,55 +78,15 @@ class QBitMonitor:
 
     def _start_safely(self):
         """安全启动流程"""
-        # 1. 启动事件监控
-        self.logger.info("启动事件监控...")
-        self.directory_monitor.start()
-        self.logger.info("事件监控已启动")
-
-        # 2. 安全扫描目录文件
-        self._safe_scan_existing_hash_files()
-
-        # 3. 启动工作线程
+        # 1. 启动任务管理器
+        self.logger.info("启动任务管理器...")
         self.task_manager.start_all_workers()
+        self.logger.info("任务管理器已启动")
 
-        # 4. 启动停滞种子监控
+        # 2. 启动停滞种子监控
         self._start_stalled_monitoring()
 
-        self.logger.info("所有启动任务加载完成，开始处理...")
-
-    def _safe_scan_existing_hash_files(self):
-        """安全扫描现有哈希文件"""
-        self.logger.info("安全扫描监控目录中的哈希文件...")
-        added_count = 0
-        completed_count = 0
-
-        try:
-            # 扫描添加目录
-            for hash_file in ADDED_TORRENTS_DIR.glob("*.hash"):
-                success = self.task_manager.submit_task(
-                    "added", hash_file.stem, str(hash_file)
-                )
-                if success:
-                    added_count += 1
-                else:
-                    self.logger.warning(f"扫描提交失败: added - {hash_file.stem}")
-
-            # 扫描完成目录
-            for hash_file in COMPLETED_TORRENTS_DIR.glob("*.hash"):
-                success = self.task_manager.submit_task(
-                    "completed", hash_file.stem, str(hash_file)
-                )
-                if success:
-                    completed_count += 1
-                else:
-                    self.logger.warning(f"扫描提交失败: completed - {hash_file.stem}")
-
-            self.logger.info(
-                f"安全扫描完成: {added_count}个添加文件, {completed_count}个完成文件"
-            )
-
-        except Exception as e:
-            self.logger.error(f"安全扫描哈希文件失败: {e}")
+        self.logger.info("系统启动完成，开始处理任务...")
 
     def _start_stalled_monitoring(self):
         """启动停滞种子监控"""
@@ -164,8 +117,10 @@ class QBitMonitor:
         """运行主循环"""
         try:
             while self.running:
+                # 定期重新加载配置
                 self.config.load_config()
 
+                # 输出系统状态（调试模式）
                 if self.config.debug_mode:
                     status = self.task_manager.get_system_status()
                     self.logger.debug(f"系统状态: {status}")
@@ -177,14 +132,78 @@ class QBitMonitor:
         except Exception as e:
             self.logger.error(f"主循环发生错误: {e}")
         finally:
-            self.stop()
+            # 只有在未停止的情况下才调用stop
+            if not self.already_stopped:
+                self.stop()
+            else:
+                self.logger.debug("系统已停止，跳过重复停止操作")
+
+    def _restore_processing_tags(self):
+        """恢复处理中的标签到原始状态"""
+        try:
+            self.logger.info("正在恢复处理中的种子标签...")
+
+            # 获取所有带有processing标签的种子
+            processing_torrents = self.qbt_client.get_torrents_by_tag(
+                tag=self.config.processing_tag
+            )
+
+            restored_count = 0
+            for torrent in processing_torrents:
+                torrent_hash = torrent.hash
+                torrent_name = torrent.name
+
+                # 检查种子是否在任务数据库中
+                has_added_task = self.task_manager.task_store.task_exists(
+                    torrent_hash, "added"
+                )
+                has_completed_task = self.task_manager.task_store.task_exists(
+                    torrent_hash, "completed"
+                )
+
+                if has_added_task:
+                    # 如果还有added任务，恢复为added标签
+                    self.qbt_client.add_tag(torrent_hash, self.config.added_tag)
+                    self.qbt_client.remove_tag(torrent_hash, self.config.processing_tag)
+                    self.logger.debug(f"恢复种子 {torrent_name} 为added标签")
+                    restored_count += 1
+                elif has_completed_task:
+                    # 如果还有completed任务，恢复为completed标签
+                    self.qbt_client.add_tag(torrent_hash, self.config.completed_tag)
+                    self.qbt_client.remove_tag(torrent_hash, self.config.processing_tag)
+                    self.logger.debug(f"恢复种子 {torrent_name} 为completed标签")
+                    restored_count += 1
+                else:
+                    # 不在任务数据库中，可能是处理中断，保留processing标签
+                    self.logger.debug(
+                        f"种子 {torrent_name} 不在任务库中，保留processing标签"
+                    )
+
+            if restored_count > 0:
+                self.logger.info(f"成功恢复了 {restored_count} 个种子的标签")
+            else:
+                self.logger.info("没有需要恢复标签的种子")
+
+        except Exception as e:
+            self.logger.error(f"恢复处理中标签失败: {e}")
 
     def stop(self):
         """停止监控器"""
+        # 防止重复停止
+        if self.already_stopped:
+            self.logger.debug("系统已经停止，跳过重复停止操作")
+            return
+
+        self.already_stopped = True
         self.running = False
-        self.directory_monitor.stop()
+
+        self.logger.info("开始停止监控器...")
+
+        # 恢复处理中的种子标签
+        self._restore_processing_tags()
+
+        # 停止所有工作线程
         self.task_manager.stop_all_workers()
-        self.task_store.close()
         self.logger.info("qBittorrent监控器已停止")
 
     def signal_handler(self, signum, frame):

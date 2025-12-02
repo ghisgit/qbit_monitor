@@ -3,7 +3,5 @@ data/
 logs/
 tests/
 __pycache__/
-added_torrents/
-completed_torrents/
 config.json
 .devcontainer/devcontainer.json

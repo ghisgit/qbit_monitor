@@ -1,4 +1,3 @@
-import time
 import random
 import logging
 from typing import Dict, List, Optional, Any
@@ -26,7 +25,6 @@ class RetryStrategyConfig:
     max_retries: Optional[int] = None  # 最大重试次数，None表示无限重试
     backoff_multiplier: float = 2.0  # 退避乘数
     jitter_factor: float = 0.1  # 随机抖动因子
-    enabled: bool = True
 
 
 class RetryStrategy:
@@ -122,11 +120,9 @@ class AdaptiveStrategy(RetryStrategy):
             return self.config.base_delay
 
         error_delays = {
-            "metadata_not_ready": 30,
             "qbit_api_error": 60,
             "network_error": 10,
             "torrent_not_found": 5,
-            "timeout": 120,
         }
 
         for error_pattern, delay in error_delays.items():
@@ -159,15 +155,6 @@ class RetryStrategyFactory:
     def get_default_strategies() -> Dict[str, RetryStrategyConfig]:
         """获取默认重试策略配置"""
         return {
-            "metadata_not_ready": RetryStrategyConfig(
-                name="metadata_not_ready",
-                strategy_type=RetryStrategyType.EXPONENTIAL_BACKOFF,
-                base_delay=30,
-                max_delay=300,
-                max_retries=None,  # 无限重试
-                backoff_multiplier=1.5,
-                jitter_factor=0.1,
-            ),
             "qbit_api_error": RetryStrategyConfig(
                 name="qbit_api_error",
                 strategy_type=RetryStrategyType.EXPONENTIAL_BACKOFF,
@@ -195,13 +182,22 @@ class RetryStrategyFactory:
                 backoff_multiplier=1,
                 jitter_factor=0.1,
             ),
-            "unknown_error": RetryStrategyConfig(
-                name="unknown_error",
+            "retry_later": RetryStrategyConfig(
+                name="retry_later",
                 strategy_type=RetryStrategyType.EXPONENTIAL_BACKOFF,
                 base_delay=120,
                 max_delay=1800,
                 max_retries=None,  # 无限重试
                 backoff_multiplier=2.0,
+                jitter_factor=0.1,
+            ),
+            "processing_exception": RetryStrategyConfig(
+                name="processing_exception",
+                strategy_type=RetryStrategyType.EXPONENTIAL_BACKOFF,
+                base_delay=30,
+                max_delay=300,
+                max_retries=None,  # 无限重试
+                backoff_multiplier=1.5,
                 jitter_factor=0.1,
             ),
         }
@@ -223,6 +219,7 @@ class StrategyManager:
             try:
                 strategy = RetryStrategyFactory.create_strategy(config)
                 self.strategies[strategy_name] = strategy
+                self.logger.debug(f"加载重试策略: {strategy_name}")
             except Exception as e:
                 self.logger.error(f"加载策略失败 {strategy_name}: {e}")
 
@@ -232,37 +229,13 @@ class StrategyManager:
         if failure_reason in self.strategies:
             return self.strategies[failure_reason]
 
-        # 尝试前缀匹配
+        # 尝试错误类型匹配
         for strategy_name, strategy in self.strategies.items():
             if failure_reason.startswith(strategy_name):
                 return strategy
 
-        # 使用未知错误策略
-        return self.strategies["unknown_error"]
-
-    def add_custom_strategy(self, name: str, config: RetryStrategyConfig):
-        """添加自定义策略"""
-        try:
-            strategy = RetryStrategyFactory.create_strategy(config)
-            self.strategies[name] = strategy
-            self.logger.info(f"添加自定义策略: {name}")
-        except Exception as e:
-            self.logger.error(f"添加自定义策略失败 {name}: {e}")
-            raise
-
-    def update_strategy(self, name: str, config: RetryStrategyConfig):
-        """更新策略"""
-        if name not in self.strategies:
-            self.logger.warning(f"策略不存在: {name}")
-            return
-
-        try:
-            strategy = RetryStrategyFactory.create_strategy(config)
-            self.strategies[name] = strategy
-            self.logger.info(f"更新策略: {name}")
-        except Exception as e:
-            self.logger.error(f"更新策略失败 {name}: {e}")
-            raise
+        # 使用retry_later作为默认策略
+        return self.strategies["retry_later"]
 
     def list_strategies(self) -> List[Dict[str, Any]]:
         """列出所有策略"""

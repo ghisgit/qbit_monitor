@@ -3,6 +3,6 @@
 # 参数: %I - 种子哈希
 
 TORRENT_HASH="$1"
-ADDED_DIR="/scripts/added_torrents"
+TAG="added"
 
-echo "$TORRENT_HASH" > "$ADDED_DIR/${TORRENT_HASH}.hash"
+curl -d "hashes=$TORRENT_HASH&tags=$TAG" http://127.0.0.1:8080/api/v2/torrents/addTags

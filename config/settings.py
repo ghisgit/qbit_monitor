@@ -1,10 +1,10 @@
 import json
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Any
 
 
 class Config:
-    """配置管理器"""
+    """配置管理器 - 清理未使用的配置"""
 
     def __init__(self, config_file: str = "config.json"):
         self.config_file = Path(config_file)
@@ -13,25 +13,19 @@ class Config:
         self._config = self._load_default_config()
         self.load_config()
 
-    def set_logger(self, logger):
-        """设置日志记录器"""
-        self._logger = logger
-
-    def _log_debug(self, message: str):
-        """记录调试日志"""
-        if self._logger and hasattr(self._logger, "debug"):
-            self._logger.debug(message)
-
-    def _log_info(self, message: str):
-        """记录信息日志"""
-        if self._logger and hasattr(self._logger, "info"):
-            self._logger.info(message)
-
     def _load_default_config(self) -> Dict:
-        """加载默认配置"""
+        """加载默认配置 - 只保留实际使用的配置"""
         return {
+            # qBittorrent连接配置
             "host": "localhost",
             "port": 8080,
+            "username": "",
+            "password": "",
+            # 标签配置
+            "added_tag": "added",
+            "completed_tag": "completed",
+            "processing_tag": "processing",
+            # 处理配置
             "check_interval": 5,
             "min_file_size_mb": 1,
             "file_patterns": [],
@@ -42,12 +36,21 @@ class Config:
             "disable_after_start": True,
             "disable_before_delete": True,
             "disable_delay": 1,
-            "max_workers": 5,
-            "batch_size": 10,
+            # 系统配置
+            "max_workers": 3,
+            "batch_size": 5,
             "poll_interval": 10,
+            # 停滞监控配置
             "min_stalled_minutes": 30,
             "stalled_check_interval": 300,
             "progress_threshold": 0.95,
+            # 熔断器配置
+            "circuit_breaker": {
+                "failure_threshold": 3,
+                "success_threshold": 2,
+                "timeout": 60,
+                "half_open_timeout": 30,
+            },
         }
 
     def load_config(self) -> bool:
@@ -66,26 +69,34 @@ class Config:
                 user_config = json.load(f)
 
             if self._logger:
-                self._log_info("检测到配置文件修改，重新加载")
+                self._logger.info("检测到配置文件修改，重新加载")
 
-                if hasattr(self, "debug_mode") and self.debug_mode:
-                    changed_keys = [
-                        key
-                        for key, value in user_config.items()
-                        if key in self._config and self._config[key] != value
-                    ]
-                    if changed_keys:
-                        self._log_debug(f"修改的配置项: {changed_keys}")
+            # 只更新实际存在的配置项
+            for key, value in user_config.items():
+                if key in self._config:
+                    # 嵌套字典的特殊处理
+                    if isinstance(value, dict) and isinstance(
+                        self._config.get(key), dict
+                    ):
+                        self._config[key].update(value)
+                    else:
+                        self._config[key] = value
+                else:
+                    if self._logger:
+                        self._logger.warning(f"忽略未定义的配置项: {key}")
 
-            self._config.update(user_config)
             return True
 
         except Exception as e:
             if self._logger:
-                self._log_info(f"加载配置文件失败: {e}")
+                self._logger.error(f"加载配置文件失败: {e}")
             return False
 
-    # 配置属性访问器
+    def set_logger(self, logger):
+        """设置日志记录器"""
+        self._logger = logger
+
+    # 配置属性访问器 - 只保留实际使用的
     @property
     def host(self) -> str:
         return self._config["host"]
@@ -93,6 +104,26 @@ class Config:
     @property
     def port(self) -> int:
         return self._config["port"]
+
+    @property
+    def username(self) -> str:
+        return self._config["username"]
+
+    @property
+    def password(self) -> str:
+        return self._config["password"]
+
+    @property
+    def added_tag(self) -> str:
+        return self._config["added_tag"]
+
+    @property
+    def completed_tag(self) -> str:
+        return self._config["completed_tag"]
+
+    @property
+    def processing_tag(self) -> str:
+        return self._config["processing_tag"]
 
     @property
     def check_interval(self) -> int:
@@ -157,3 +188,11 @@ class Config:
     @property
     def progress_threshold(self) -> float:
         return self._config["progress_threshold"]
+
+    @property
+    def circuit_breaker_config(self) -> Dict:
+        return self._config["circuit_breaker"]
+
+    def get_all_config(self) -> Dict[str, Any]:
+        """获取所有配置（用于调试）"""
+        return self._config.copy()

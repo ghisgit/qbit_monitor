@@ -17,7 +17,7 @@ class StalledSeedInfo:
 
 
 class StalledSeedMonitor:
-    """停滞种子监控器 - 专门处理 stalled 状态的种子"""
+    """停滞种子监控器"""
 
     def __init__(self, qbt_client, config):
         self.qbt_client = qbt_client
@@ -52,33 +52,33 @@ class StalledSeedMonitor:
             self.logger.error(f"扫描停滞种子失败: {e}")
             return []
 
-    def _get_stalled_torrents(self) -> List[Dict]:
+    def _get_stalled_torrents(self) -> List:
         """获取停滞状态的种子"""
         try:
-            response = self.qbt_client.session.get(
-                f"{self.qbt_client.base_url}/api/v2/torrents/info",
-                params={"filter": "stalled"},
+            stalled_torrents = self.qbt_client.torrents_info(
+                status_filter="downloading"
             )
 
-            if response.status_code == 200:
-                torrents = response.json()
-                # 过滤掉已完成的种子，只处理下载中的
-                return [t for t in torrents if t.get("progress", 1) < 1.0]
-            else:
-                self.logger.error(f"获取停滞种子API错误: {response.status_code}")
-                return []
+            active_stalled = [
+                torrent
+                for torrent in stalled_torrents
+                if torrent.progress < 0.95 and torrent.state == "stalledDL"
+            ]
+
+            self.logger.debug(f"发现 {len(active_stalled)} 个活跃的停滞种子")
+            return active_stalled
 
         except Exception as e:
             self.logger.error(f"获取停滞种子列表失败: {e}")
             return []
 
     def _process_stalled_torrent(
-        self, torrent: Dict, current_time: float
+        self, torrent, current_time: float
     ) -> Optional[StalledSeedInfo]:
         """处理单个停滞种子"""
-        torrent_hash = torrent["hash"]
-        progress = torrent.get("progress", 0)
-        name = torrent.get("name", "Unknown")
+        torrent_hash = torrent.hash
+        progress = torrent.progress
+        name = torrent.name
 
         # 检查进度条件：只处理未完成的种子
         if progress >= self.progress_threshold:
@@ -97,9 +97,11 @@ class StalledSeedMonitor:
                 )
                 seed_info.tracked_since = current_time
                 seed_info.progress = progress
+                seed_info.state = torrent.state
             else:
-                # 进度无变化，更新进度值
+                # 进度无变化，更新进度值和状态
                 seed_info.progress = progress
+                seed_info.state = torrent.state
 
         else:
             # 新发现的停滞种子
@@ -107,7 +109,7 @@ class StalledSeedMonitor:
                 torrent_hash=torrent_hash,
                 name=name,
                 progress=progress,
-                state=torrent.get("state", ""),
+                state=torrent.state,
                 tracked_since=current_time,
             )
             self.tracked_seeds[torrent_hash] = seed_info
@@ -130,28 +132,25 @@ class StalledSeedMonitor:
     def _lower_torrent_priority(self, seed_info: StalledSeedInfo) -> bool:
         """降低种子优先级到最低"""
         try:
-            response = self.qbt_client.session.post(
-                f"{self.qbt_client.base_url}/api/v2/torrents/bottomPrio",
-                data={"hashes": seed_info.torrent_hash},
+            # 使用qbittorrent-api设置最低优先级
+            self.qbt_client.client.torrents_bottom_priority(
+                torrent_hashes=seed_info.torrent_hash
             )
 
-            if response.status_code == 200:
-                self.logger.warning(
-                    f"停滞种子优先级已调低: {seed_info.name} "
-                    f"(进度: {seed_info.progress:.1%}, 停滞: {(time.time() - seed_info.tracked_since) / 60:.1f}分钟)"
-                )
-                return True
-            else:
-                self.logger.error(f"设置种子优先级失败: {response.status_code}")
-                return False
+            self.logger.warning(
+                f"停滞种子优先级已调低: {seed_info.name} "
+                f"(进度: {seed_info.progress:.1%}, 状态: {seed_info.state}, "
+                f"停滞: {(time.time() - seed_info.tracked_since) / 60:.1f}分钟)"
+            )
+            return True
 
         except Exception as e:
             self.logger.error(f"降低种子优先级失败 {seed_info.name}: {e}")
             return False
 
-    def _cleanup_recovered_seeds(self, current_stalled: List[Dict]):
-        """清理已恢复的种子（不再处于stalled状态）"""
-        current_hashes = {t["hash"] for t in current_stalled}
+    def _cleanup_recovered_seeds(self, current_stalled: List):
+        """清理已恢复的种子"""
+        current_hashes = {torrent.hash for torrent in current_stalled}
 
         # 找出已恢复的种子（之前跟踪但现在不在stalled列表中）
         recovered_hashes = set(self.tracked_seeds.keys()) - current_hashes
@@ -192,40 +191,10 @@ class StalledSeedMonitor:
                 {
                     "name": s.name,
                     "progress": f"{s.progress:.1%}",
+                    "state": s.state,
                     "stalled_minutes": f"{(current_time - s.tracked_since) / 60:.1f}",
                     "priority_downgraded": s.priority_downgraded,
                 }
-                for s in list(self.tracked_seeds.values())[:10]  # 只显示前10个
+                for s in list(self.tracked_seeds.values())[:10]
             ],
         }
-
-    def manually_restore_priority(self, torrent_hash: str) -> bool:
-        """手动恢复种子优先级（用于调试或特殊情况）"""
-        try:
-            if torrent_hash in self.tracked_seeds:
-                seed_info = self.tracked_seeds[torrent_hash]
-
-                # 使用topPrio恢复优先级
-                response = self.qbt_client.session.post(
-                    f"{self.qbt_client.base_url}/api/v2/torrents/topPrio",
-                    params={"hashes": torrent_hash},
-                )
-
-                if response.status_code == 200:
-                    seed_info.priority_downgraded = False
-                    self.logger.info(f"手动恢复种子优先级: {seed_info.name}")
-                    return True
-
-            return False
-
-        except Exception as e:
-            self.logger.error(f"手动恢复优先级失败: {e}")
-            return False
-
-    def reset_tracking(self, torrent_hash: str) -> bool:
-        """重置种子跟踪状态（当种子被手动恢复时使用）"""
-        if torrent_hash in self.tracked_seeds:
-            del self.tracked_seeds[torrent_hash]
-            self.logger.info(f"重置种子跟踪状态: {torrent_hash}")
-            return True
-        return False

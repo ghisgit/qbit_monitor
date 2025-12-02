@@ -1,96 +1,145 @@
-import os
 import threading
 import time
 import logging
-import uuid
-from typing import List
 from persistence.task_store import TaskStore, Task
-from circuit_breaker.breaker import CircuitBreaker
-from circuit_breaker.health_checker import QBittorrentHealthChecker
-from retry_engine.infinite_retry import InfiniteRetryEngine
+from circuit_breaker.breaker import SimpleCircuitBreaker
+from circuit_breaker.health_checker import SimpleHealthChecker
+from retry_engine.infinite_retry import RetryEngine
 
 
-class ResilientTaskManager:
-    """弹性任务管理器 - 支持无限重试和熔断保护"""
+class TaskManager:
+    """任务管理器 - 只有任务完成或种子不存在时才删除任务"""
 
-    def __init__(
-        self, event_handler, task_store: TaskStore, qbt_client, file_ops, config
-    ):
+    def __init__(self, event_handler, qbt_client, config):
         self.event_handler = event_handler
-        self.task_store = task_store
+        self.qbt_client = qbt_client
         self.config = config
         self.logger = logging.getLogger(__name__)
 
-        # 核心组件
-        self.circuit_breaker = CircuitBreaker(task_store)
-        self.health_checker = QBittorrentHealthChecker(qbt_client)
-        self.retry_engine = InfiniteRetryEngine()
+        # 存储
+        self.task_store = TaskStore()
+
+        # 组件
+        self.circuit_breaker = SimpleCircuitBreaker(config)
+        self.health_checker = SimpleHealthChecker(qbt_client)
+        self.retry_engine = RetryEngine(config)
 
         # 工作线程管理
         self.workers = []
         self.running = True
+        self.task_scanner_thread = None
+        self.cleanup_thread = None
 
-        # 性能调节
+        # 配置
+        self.max_workers = getattr(config, "max_workers", 3)
         self.batch_size = getattr(config, "batch_size", 5)
         self.poll_interval = getattr(config, "poll_interval", 10)
-        self.max_workers = getattr(config, "max_workers", 3)
-
-        # 熔断器状态跟踪
-        self.last_breaker_check = time.time()
-        self.consecutive_breaker_failures = 0
-
-    def submit_task(
-        self, task_type: str, torrent_hash: str, hash_file_path: str
-    ) -> bool:
-        """提交新任务 - 原子性操作"""
-        try:
-            # 生成唯一任务ID
-            task_uuid = str(uuid.uuid4())
-
-            # 创建任务对象
-            current_time = time.time()
-            task = Task(
-                task_uuid=task_uuid,
-                torrent_hash=torrent_hash,
-                task_type=task_type,
-                status="pending",
-                hash_file_path=hash_file_path,
-                created_time=current_time,
-                updated_time=current_time,
-            )
-
-            # 保存到数据库
-            success = self.task_store.save_task(task)
-
-            if success:
-                self.logger.info(f"任务提交成功: {task_type} - {torrent_hash}")
-
-                # 只有数据库保存成功后才清理文件
-                self._cleanup_hash_file(hash_file_path)
-                return True
-            else:
-                self.logger.error(f"任务提交失败: {task_type} - {torrent_hash}")
-                return False
-
-        except Exception as e:
-            self.logger.error(f"任务提交异常: {torrent_hash}, 错误: {e}")
-            return False
 
     def start_all_workers(self):
         """启动所有工作线程"""
+        # 1. 启动任务扫描器
+        self.task_scanner_thread = threading.Thread(
+            target=self._tag_based_scanner, name="tag_scanner", daemon=True
+        )
+        self.task_scanner_thread.start()
+
+        # 2. 启动任务处理线程
         for i in range(self.max_workers):
             worker = threading.Thread(
-                target=self._database_polling_worker,
+                target=self._task_processing_worker,
                 name=f"task_worker_{i}",
-                daemon=False,
+                daemon=True,
             )
             self.workers.append(worker)
             worker.start()
 
-        self.logger.info(f"启动了 {self.max_workers} 个数据库轮询工作线程")
+        # 3. 启动孤儿任务清理线程
+        self.cleanup_thread = threading.Thread(
+            target=self._orphan_task_cleanup_worker, name="orphan_cleanup", daemon=True
+        )
+        self.cleanup_thread.start()
 
-    def _database_polling_worker(self):
-        """数据库轮询工作线程 - 修复熔断器逻辑"""
+        self.logger.info(
+            f"启动了标签扫描器、{self.max_workers} 个任务处理线程和孤儿任务清理线程"
+        )
+
+    def _tag_based_scanner(self):
+        """基于标签的任务扫描器"""
+        self.logger.info("标签任务扫描器开始运行")
+
+        while self.running:
+            try:
+                # 检查系统健康状态
+                if self.health_checker.should_pause_processing():
+                    self.logger.warning("标签扫描器因系统不健康暂停处理")
+                    time.sleep(30)
+                    continue
+
+                # 检查熔断器状态
+                if not self.circuit_breaker.can_execute():
+                    self.logger.debug("标签扫描器因熔断器开启暂停处理")
+                    time.sleep(10)
+                    continue
+
+                # 扫描添加标签的任务（排除metaDL状态）
+                added_torrents = self.qbt_client.get_torrents_by_tag(
+                    tag=self.config.added_tag,
+                    exclude_states=["metaDL", "queuedDL", "forcedMetaDL"],
+                )
+
+                for torrent in added_torrents:
+                    if not self.running:
+                        break
+
+                    if not self.task_store.task_exists(torrent.hash, "added"):
+                        if self.task_store.save_task(torrent.hash, "added"):
+                            self.logger.info(
+                                f"发现新添加任务: {torrent.hash} - {torrent.name}"
+                            )
+
+                            # 更新标签
+                            self.qbt_client.add_tag(
+                                torrent.hash, self.config.processing_tag
+                            )
+                            self.qbt_client.remove_tag(
+                                torrent.hash, self.config.added_tag
+                            )
+
+                # 扫描完成标签的任务
+                completed_torrents = self.qbt_client.get_torrents_by_tag(
+                    tag=self.config.completed_tag
+                )
+
+                for torrent in completed_torrents:
+                    if not self.running:
+                        break
+
+                    if not self.task_store.task_exists(torrent.hash, "completed"):
+                        if self.task_store.save_task(torrent.hash, "completed"):
+                            self.logger.info(
+                                f"发现新完成任务: {torrent.hash} - {torrent.name}"
+                            )
+
+                            # 更新标签
+                            self.qbt_client.add_tag(
+                                torrent.hash, self.config.processing_tag
+                            )
+                            self.qbt_client.remove_tag(
+                                torrent.hash, self.config.completed_tag
+                            )
+
+                # 休眠后继续扫描
+                time.sleep(self.poll_interval)
+
+            except Exception as e:
+                self.logger.error(f"标签扫描器运行失败: {e}")
+                self.circuit_breaker.record_failure()
+                time.sleep(30)
+
+        self.logger.info("标签任务扫描器停止运行")
+
+    def _task_processing_worker(self):
+        """任务处理工作线程"""
         thread_name = threading.current_thread().name
         self.logger.debug(f"{thread_name} 开始运行")
 
@@ -102,27 +151,18 @@ class ResilientTaskManager:
                     time.sleep(30)
                     continue
 
-                # 检查熔断器状态 - 真正阻止执行
-                if not self.circuit_breaker.can_execute("qbit_api"):
-                    breaker_status = self.circuit_breaker.get_breaker_status("qbit_api")
-                    self.logger.warning(
-                        f"{thread_name} 因熔断器开启暂停处理。状态: {breaker_status['state']}, "
-                        f"失败次数: {breaker_status['failure_count']}"
-                    )
+                # 检查熔断器状态
+                if not self.circuit_breaker.can_execute():
+                    self.logger.debug(f"{thread_name} 因熔断器开启暂停处理")
                     time.sleep(10)
                     continue
 
-                # 根据健康状态调整批处理大小
-                speed_factor = self.health_checker.get_processing_speed_factor()
-                adjusted_batch_size = max(1, int(self.batch_size * speed_factor))
-
                 # 获取待处理任务
-                tasks = self.task_store.get_eligible_tasks(limit=adjusted_batch_size)
+                tasks = self.task_store.get_pending_tasks(limit=self.batch_size)
 
                 if tasks:
                     self.logger.debug(f"{thread_name} 获取到 {len(tasks)} 个任务")
 
-                    # 处理任务
                     for task in tasks:
                         if not self.running:
                             break
@@ -131,138 +171,218 @@ class ResilientTaskManager:
                     # 快速处理下一批任务
                     continue
                 else:
-                    # 没有任务，根据系统负载调整休眠时间
-                    sleep_time = self.poll_interval
-                    if speed_factor < 0.5:
-                        sleep_time *= 2  # 系统负载高时延长休眠
-
-                    time.sleep(sleep_time)
+                    # 没有任务，休眠
+                    time.sleep(2)
 
             except Exception as e:
-                self.logger.error(f"{thread_name} 轮询处理失败: {e}")
-                self.circuit_breaker.record_failure("qbit_api")
-                time.sleep(self.poll_interval * 2)
+                self.logger.error(f"{thread_name} 处理失败: {e}")
+                self.circuit_breaker.record_failure()
+                time.sleep(10)
 
         self.logger.debug(f"{thread_name} 停止运行")
 
     def _process_single_task(self, task: Task):
-        """处理单个任务 - 增强熔断器记录"""
+        """处理单个任务"""
         try:
-            # 再次检查熔断器状态（防止状态在获取任务后变化）
-            if not self.circuit_breaker.can_execute("qbit_api"):
+            # 检查熔断器状态
+            if not self.circuit_breaker.can_execute():
                 self.logger.warning(f"任务 {task.torrent_hash} 因熔断器开启被跳过")
                 return
 
-            # 直接执行任务处理
+            # 执行任务处理
             if task.task_type == "added":
-                result = self.event_handler.process_torrent_addition(
-                    task.torrent_hash, task.hash_file_path
-                )
+                result = self.event_handler.process_torrent_addition(task.torrent_hash)
             else:  # completed
                 result = self.event_handler.process_torrent_completion(
-                    task.torrent_hash, task.hash_file_path
+                    task.torrent_hash
                 )
 
-            # 处理结果 - 正确记录熔断器状态
+            # 处理结果
             if result == "success":
                 self._handle_success(task)
-                self.circuit_breaker.record_success("qbit_api")  # 明确记录成功
-            else:
-                # 任何失败都安排重试并记录熔断器失败
-                self._handle_retry(
-                    task, result if result != "retry_later" else "unknown_error"
+                self.circuit_breaker.record_success()
+
+                # 移除处理中标签
+                self.qbt_client.remove_tag(
+                    task.torrent_hash, self.config.processing_tag
                 )
 
-                # 只有真正的系统错误才记录熔断器失败
-                if result in ["qbit_api_error", "network_error"]:
-                    self.circuit_breaker.record_failure("qbit_api")
-                else:
-                    # 业务逻辑错误不记录熔断器失败
-                    self.logger.debug(f"业务逻辑错误，不记录熔断器失败: {result}")
+            elif result == "torrent_not_found":
+                # 种子不存在，删除任务
+                self._handle_torrent_not_found(task)
+
+            else:
+                self._handle_failure(task, result)
 
         except Exception as e:
             self.logger.error(f"任务处理异常: {task.torrent_hash}, 错误: {e}")
-            self._handle_retry(task, f"processing_exception:{str(e)}")
-            self.circuit_breaker.record_failure("qbit_api")  # 异常时记录失败
+            self._handle_failure(task, f"exception:{str(e)}")
+            self.circuit_breaker.record_failure()
 
     def _handle_success(self, task: Task):
-        """处理成功结果"""
+        """处理成功结果 - 任务完成，从数据库删除"""
         try:
-            success = self.task_store.update_task_after_processing(
-                task_uuid=task.task_uuid, success=True
-            )
+            # 从数据库删除任务
+            success = self.task_store.complete_task(task.torrent_hash, task.task_type)
 
             if success:
-                self.logger.info(f"任务处理成功: {task.torrent_hash}")
-                # 注意：熔断器成功记录已经在 _process_single_task 中处理
+                self.logger.info(
+                    f"任务处理成功并删除: {task.torrent_hash} - {task.task_type}"
+                )
             else:
-                self.logger.error(f"更新任务状态失败: {task.torrent_hash}")
+                self.logger.error(
+                    f"删除完成任务失败: {task.torrent_hash} - {task.task_type}"
+                )
 
         except Exception as e:
             self.logger.error(f"处理成功结果失败: {task.torrent_hash}, 错误: {e}")
 
-    def _handle_retry(self, task: Task, failure_reason: str):
-        """处理重试结果"""
+    def _handle_torrent_not_found(self, task: Task):
+        """处理种子不存在的情况 - 从数据库删除任务"""
         try:
-            # 计算下次重试时间
+            # 从数据库删除任务
+            success = self.task_store.complete_task(task.torrent_hash, task.task_type)
+
+            if success:
+                self.logger.info(
+                    f"种子不存在，删除任务: {task.torrent_hash} - {task.task_type}"
+                )
+
+                # 移除处理中标签（如果还存在）
+                self.qbt_client.remove_tag(
+                    task.torrent_hash, self.config.processing_tag
+                )
+            else:
+                self.logger.error(
+                    f"删除种子不存在任务失败: {task.torrent_hash} - {task.task_type}"
+                )
+
+        except Exception as e:
+            self.logger.error(f"处理种子不存在结果失败: {task.torrent_hash}, 错误: {e}")
+
+    def _handle_failure(self, task: Task, failure_reason: str):
+        """处理失败结果 - 使用重试引擎"""
+        try:
+            # 使用重试引擎计算下次重试时间
             next_retry_time = self.retry_engine.calculate_next_retry(
                 task, failure_reason
             )
 
             if next_retry_time is None:
-                # 不应该继续重试，归档任务
-                self.task_store.archive_task(
-                    task.task_uuid, f"max_retries_reached:{failure_reason}"
+                # 达到最大重试次数，但仍然不删除任务
+                self.logger.error(
+                    f"任务达到最大重试次数但仍保留: {task.torrent_hash} - {failure_reason}"
                 )
-                self.logger.warning(f"任务达到最大重试次数: {task.torrent_hash}")
+
+                # 获取重试策略信息
+                retry_info = self.retry_engine.get_retry_info(failure_reason)
+
+                # 安排较长时间后的重试（如1小时）
+                self.task_store.schedule_retry(
+                    torrent_hash=task.torrent_hash,
+                    task_type=task.task_type,
+                    next_retry_time=time.time() + 3600,  # 1小时后再试
+                    failure_reason=f"max_retries_reached:{failure_reason}",
+                )
+
+                self.logger.warning(
+                    f"任务 {task.torrent_hash} 达到最大重试次数，"
+                    f"策略: {retry_info.get('strategy_name', 'unknown')}, "
+                    f"将在1小时后重试"
+                )
             else:
                 # 安排重试
-                success = self.task_store.update_task_after_processing(
-                    task_uuid=task.task_uuid,
-                    success=False,
-                    failure_reason=failure_reason,
-                    error_message=failure_reason,
+                success = self.task_store.schedule_retry(
+                    torrent_hash=task.torrent_hash,
+                    task_type=task.task_type,
                     next_retry_time=next_retry_time,
+                    failure_reason=failure_reason,
                 )
 
                 if success:
-                    self.logger.debug(
-                        f"任务安排重试: {task.torrent_hash}, 下次重试: {next_retry_time}"
+                    # 获取重试策略信息用于日志
+                    retry_info = self.retry_engine.get_retry_info(failure_reason)
+                    retry_delay = next_retry_time - time.time()
+
+                    self.logger.warning(
+                        f"任务安排重试: {task.torrent_hash}, "
+                        f"原因: {failure_reason}, "
+                        f"策略: {retry_info.get('strategy_name', 'unknown')}, "
+                        f"延迟: {retry_delay:.1f}秒, "
+                        f"下次重试: {time.strftime('%H:%M:%S', time.localtime(next_retry_time))}"
                     )
                 else:
                     self.logger.error(f"安排重试失败: {task.torrent_hash}")
 
-        except Exception as e:
-            self.logger.error(f"处理重试结果失败: {task.torrent_hash}, 错误: {e}")
+            # 只有真正的系统错误才记录熔断器失败
+            if any(
+                err in failure_reason for err in ["qbit_api_error", "network_error"]
+            ):
+                self.circuit_breaker.record_failure()
 
-    def _cleanup_hash_file(self, hash_file_path: str):
-        """清理哈希文件"""
-        try:
-            if os.path.exists(hash_file_path):
-                os.remove(hash_file_path)
-                self.logger.debug(f"已删除哈希文件: {hash_file_path}")
         except Exception as e:
-            self.logger.warning(f"删除哈希文件失败: {hash_file_path}, 错误: {e}")
+            self.logger.error(f"处理失败结果失败: {task.torrent_hash}, 错误: {e}")
+
+    def _orphan_task_cleanup_worker(self):
+        """孤儿任务清理线程 - 清理种子已不存在的任务"""
+        self.logger.info("孤儿任务清理线程开始运行")
+
+        while self.running:
+            try:
+                # 每天清理一次孤儿任务
+                self.task_store.cleanup_orphaned_tasks(
+                    qbt_client=self.qbt_client, days=1  # 检查1天前更新的任务
+                )
+
+                # 休眠24小时
+                for _ in range(1440):  # 24小时，每分钟检查一次是否停止
+                    if not self.running:
+                        break
+                    time.sleep(60)
+
+            except Exception as e:
+                self.logger.error(f"孤儿任务清理失败: {e}")
+                time.sleep(3600)  # 1小时后重试
+
+        self.logger.info("孤儿任务清理线程停止运行")
 
     def stop_all_workers(self):
         """停止所有工作线程"""
         self.running = False
         self.logger.info("停止所有工作线程...")
 
+        # 等待任务扫描器
+        if self.task_scanner_thread and self.task_scanner_thread.is_alive():
+            self.task_scanner_thread.join(timeout=10)
+
+        # 等待工作线程
         for worker in self.workers:
             if worker.is_alive():
                 worker.join(timeout=10)
 
+        # 等待清理线程
+        if self.cleanup_thread and self.cleanup_thread.is_alive():
+            self.cleanup_thread.join(timeout=10)
+
+        # 获取最终统计信息
+        stats = self.task_store.get_task_stats()
+        self.logger.info(f"任务统计: {stats}")
+
+        # 关闭存储
+        self.task_store.close()
+
         self.logger.info("所有工作线程已停止")
 
     def get_system_status(self) -> dict:
-        """获取系统状态 - 包含熔断器信息"""
-        health_status = self.health_checker.get_system_load_status()
-        breaker_status = self.circuit_breaker.get_breaker_status("qbit_api")
+        """获取系统状态"""
+        health_status = self.health_checker.get_status()
+        breaker_status = self.circuit_breaker.get_status()
+        task_stats = self.task_store.get_task_stats()
 
         return {
-            "health_status": health_status,
+            "health": health_status,
             "circuit_breaker": breaker_status,
+            "task_stats": task_stats,
             "active_workers": len([w for w in self.workers if w.is_alive()]),
             "running": self.running,
         }
