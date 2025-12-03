@@ -107,7 +107,7 @@ class TaskStore:
             with self.transaction() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "SELECT 1 FROM tasks WHERE torrent_hash = ? AND task_type = ?",
+                    "SELECT 1 FROM tasks WHERE torrent_hash = ? AND task_type = ? AND status != 'deleted'",
                     (torrent_hash, task_type),
                 )
                 return cursor.fetchone() is not None
@@ -139,8 +139,12 @@ class TaskStore:
         """获取待处理任务"""
         try:
             current_time = time.time()
+            tasks = []
+
             with self.transaction() as conn:
                 cursor = conn.cursor()
+
+                # 第一步：查询需要处理的任务
                 cursor.execute(
                     """
                     SELECT torrent_hash, task_type, status, retry_count, 
@@ -158,30 +162,45 @@ class TaskStore:
                     (current_time, limit),
                 )
 
-                tasks = []
-                for row in cursor.fetchall():
-                    task = Task(
-                        torrent_hash=row[0],
-                        task_type=row[1],
-                        status=row[2],
-                        retry_count=row[3],
-                        last_attempt=row[4],
-                        next_retry=row[5],
-                        failure_reason=row[6] or "",
-                    )
-                    tasks.append(task)
+                task_rows = cursor.fetchall()
 
-                    # 标记为处理中
+                # 第二步：逐个标记为processing（避免并发问题）
+                for row in task_rows:
+                    torrent_hash = row[0]
+                    task_type = row[1]
+
+                    # 尝试更新状态，确保只有我们获取到这个任务
                     cursor.execute(
                         """
                         UPDATE tasks 
                         SET status = 'processing', last_attempt = ?, updated_time = ?
-                        WHERE torrent_hash = ? AND task_type = ?
-                    """,
-                        (current_time, current_time, row[0], row[1]),
+                        WHERE torrent_hash = ? AND task_type = ? AND status IN ('pending', 'failed')
+                        """,
+                        (current_time, current_time, torrent_hash, task_type),
                     )
 
+                    # 检查是否成功更新
+                    if cursor.rowcount > 0:
+                        # 成功获取到任务，添加到返回列表
+                        task = Task(
+                            torrent_hash=torrent_hash,
+                            task_type=task_type,
+                            status=row[2],
+                            retry_count=row[3],
+                            last_attempt=row[4],
+                            next_retry=row[5],
+                            failure_reason=row[6] or "",
+                        )
+                        tasks.append(task)
+                        self.logger.debug(f"成功获取任务: {torrent_hash} - {task_type}")
+                    else:
+                        # 任务已被其他线程获取，跳过
+                        self.logger.debug(
+                            f"任务已被其他线程获取: {torrent_hash} - {task_type}"
+                        )
+
                 return tasks
+
         except Exception as e:
             self.logger.error(f"获取待处理任务失败: {e}")
             return []
@@ -191,6 +210,27 @@ class TaskStore:
         try:
             with self.transaction() as conn:
                 cursor = conn.cursor()
+
+                # 先检查任务是否存在且状态为processing
+                cursor.execute(
+                    "SELECT status FROM tasks WHERE torrent_hash = ? AND task_type = ?",
+                    (torrent_hash, task_type),
+                )
+
+                task_info = cursor.fetchone()
+                if not task_info:
+                    self.logger.debug(
+                        f"任务不存在，无需删除: {torrent_hash} - {task_type}"
+                    )
+                    return False
+
+                current_status = task_info[0]
+                if current_status != "processing":
+                    self.logger.warning(
+                        f"任务状态不是processing，当前状态: {current_status}"
+                    )
+
+                # 删除任务
                 cursor.execute(
                     "DELETE FROM tasks WHERE torrent_hash = ? AND task_type = ?",
                     (torrent_hash, task_type),
@@ -198,7 +238,12 @@ class TaskStore:
 
                 deleted = cursor.rowcount > 0
                 if deleted:
-                    self.logger.debug(f"任务完成并删除: {torrent_hash} - {task_type}")
+                    self.logger.debug(f"任务删除成功: {torrent_hash} - {task_type}")
+                else:
+                    self.logger.debug(
+                        f"任务删除失败（可能已被删除）: {torrent_hash} - {task_type}"
+                    )
+
                 return deleted
         except Exception as e:
             self.logger.error(f"完成任务失败: {e}")
@@ -235,7 +280,13 @@ class TaskStore:
                     ),
                 )
 
-                return cursor.rowcount > 0
+                updated = cursor.rowcount > 0
+                if not updated:
+                    self.logger.debug(
+                        f"安排重试失败，任务不存在: {torrent_hash} - {task_type}"
+                    )
+
+                return updated
         except Exception as e:
             self.logger.error(f"安排重试失败: {e}")
             return False

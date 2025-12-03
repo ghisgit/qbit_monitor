@@ -183,13 +183,21 @@ class TaskManager:
 
     def _process_single_task(self, task: Task):
         """处理单个任务"""
+        thread_name = threading.current_thread().name
+
         try:
             # 检查熔断器状态
             if not self.circuit_breaker.can_execute():
-                self.logger.warning(f"任务 {task.torrent_hash} 因熔断器开启被跳过")
+                self.logger.warning(
+                    f"{thread_name}: 任务 {task.torrent_hash} 因熔断器开启被跳过"
+                )
                 return
 
             # 执行任务处理
+            self.logger.debug(
+                f"{thread_name}: 开始处理任务: {task.torrent_hash} - {task.task_type}"
+            )
+
             if task.task_type == "added":
                 result = self.event_handler.process_torrent_addition(task.torrent_hash)
             else:  # completed
@@ -215,7 +223,9 @@ class TaskManager:
                 self._handle_failure(task, result)
 
         except Exception as e:
-            self.logger.error(f"任务处理异常: {task.torrent_hash}, 错误: {e}")
+            self.logger.error(
+                f"{thread_name}: 任务处理异常: {task.torrent_hash}, 错误: {e}"
+            )
             self._handle_failure(task, f"exception:{str(e)}")
             self.circuit_breaker.record_failure()
 
@@ -230,8 +240,9 @@ class TaskManager:
                     f"任务处理成功并删除: {task.torrent_hash} - {task.task_type}"
                 )
             else:
-                self.logger.error(
-                    f"删除完成任务失败: {task.torrent_hash} - {task.task_type}"
+                # 这可能是正常情况，比如任务已被其他线程删除
+                self.logger.debug(
+                    f"任务删除可能已由其他线程完成: {task.torrent_hash} - {task.task_type}"
                 )
 
         except Exception as e:
@@ -253,8 +264,8 @@ class TaskManager:
                     task.torrent_hash, self.config.processing_tag
                 )
             else:
-                self.logger.error(
-                    f"删除种子不存在任务失败: {task.torrent_hash} - {task.task_type}"
+                self.logger.warning(
+                    f"种子不存在但删除任务失败（可能已删除）: {task.torrent_hash} - {task.task_type}"
                 )
 
         except Exception as e:
@@ -312,7 +323,9 @@ class TaskManager:
                         f"下次重试: {time.strftime('%H:%M:%S', time.localtime(next_retry_time))}"
                     )
                 else:
-                    self.logger.error(f"安排重试失败: {task.torrent_hash}")
+                    self.logger.debug(
+                        f"安排重试失败，任务可能已被删除: {task.torrent_hash}"
+                    )
 
             # 只有真正的系统错误才记录熔断器失败
             if any(
