@@ -9,7 +9,7 @@ import logging
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import List, Dict, Any
-from .database import DatabaseManager
+from utils.database import DatabaseManager
 
 
 @dataclass
@@ -109,14 +109,38 @@ class TaskStore:
 
             with self.db_manager.transaction(self.db_path) as conn:
                 cursor = conn.cursor()
+
                 cursor.execute(
                     """
-                    INSERT OR REPLACE INTO tasks 
-                    (torrent_hash, task_type, created_time, updated_time)
-                    VALUES (?, ?, ?, ?)
-                """,
+                    SELECT 1 FROM tasks 
+                    WHERE torrent_hash = ? AND status = 'processing'
+                    LIMIT 1
+                    """,
+                    (torrent_hash,),
+                )
+
+                if cursor.fetchone():
+                    return False
+
+                cursor.execute(
+                    """
+                    INSERT OR IGNORE INTO tasks 
+                    (torrent_hash, task_type, created_time, updated_time, status)
+                    VALUES (?, ?, ?, ?, 'pending')
+                    """,
                     (torrent_hash, task_type, current_time, current_time),
                 )
+
+                if cursor.rowcount == 0:
+                    cursor.execute(
+                        """
+                        UPDATE tasks 
+                        SET status = 'pending', updated_time = ?
+                        WHERE torrent_hash = ? AND task_type = ? 
+                        AND status != 'processing'
+                        """,
+                        (current_time, torrent_hash, task_type),
+                    )
 
                 return cursor.rowcount > 0
 
@@ -236,8 +260,11 @@ class TaskStore:
                 """,
                     (torrent_hash, task_type),
                 )
+                success = cursor.rowcount > 0
 
-                return cursor.rowcount > 0
+                time.sleep(0.1)
+
+                return success
 
         except Exception as e:
             self.logger.error(f"完成任务失败: {e}")

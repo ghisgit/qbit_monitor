@@ -7,7 +7,7 @@ import threading
 import time
 import logging
 import os
-from typing import List, Tuple
+from typing import List
 from .client import QBittorrentClient
 from .files import FileManager
 from .storage import TaskStore, Task
@@ -132,6 +132,13 @@ class TaskManager:
 
     def _process_added_torrent(self, torrent):
         """处理新发现的added种子"""
+
+        # 检查是否已经是processing标签
+        current_tags = (torrent.tags or "").split(", ")
+        if self.config.processing_tag in current_tags:
+            self.logger.debug(f"种子已在处理中，跳过: {torrent.name}")
+            return
+
         if not self.task_store.task_exists(torrent.hash, "added"):
             if self.task_store.save_task(torrent.hash, "added"):
                 self.logger.info(f"发现新任务: {torrent.name} (状态: {torrent.state})")
@@ -142,6 +149,13 @@ class TaskManager:
 
     def _process_completed_torrent(self, torrent):
         """处理新发现的completed种子"""
+
+        # 检查是否已经是processing标签
+        current_tags = (torrent.tags or "").split(", ")
+        if self.config.processing_tag in current_tags:
+            self.logger.debug(f"种子已在处理中，跳过: {torrent.name}")
+            return
+
         if not self.task_store.task_exists(torrent.hash, "completed"):
             if self.task_store.save_task(torrent.hash, "completed"):
                 self.logger.info(f"发现完成种子: {torrent.name}")
