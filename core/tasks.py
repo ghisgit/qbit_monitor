@@ -252,7 +252,9 @@ class TaskManager:
         files_to_disable = []
 
         for file in files:
-            if self.file_manager.should_disable_file(file["name"]):
+            if file["priority"] != 0 and self.file_manager.should_disable_file(
+                file["name"]
+            ):
                 files_to_disable.append(file["index"])
 
         return files_to_disable
