@@ -87,9 +87,6 @@ class TaskManager:
                 self._scan_added_tasks()
                 self._scan_completed_tasks()
 
-                # 定期清理旧任务
-                self._periodic_cleanup()
-
                 # 重置错误计数
                 error_count = 0
 
@@ -163,11 +160,6 @@ class TaskManager:
                 # 更新标签
                 self.client.add_tag(torrent.hash, self.config.processing_tag)
                 self.client.remove_tag(torrent.hash, self.config.completed_tag)
-
-    def _periodic_cleanup(self):
-        """定期清理"""
-        if int(time.time()) % 3600 < self.config.poll_interval:
-            self.task_store.cleanup_old_tasks(1)
 
     def _handle_scan_error(self, error: Exception, error_count: int):
         """处理扫描错误"""
